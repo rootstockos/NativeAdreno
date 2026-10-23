@@ -32,7 +32,7 @@ remains: the rows below from *Clock gating* down are not written yet.
 | Protect | `CP_PROTECT(i)` 0x0850, last span at index `count_max-1` | `CP_PROTECT_GLOBAL(i)` 0x0850, last span again at `CP_PROTECT_PIPE(15)` 0x08af for BR and BV | 47 writes; control word 0xffff000b to `CP_PROTECT_CNTL_PIPE` 0x084e per pipe |
 | Clock gating | `a740_hwcg` table + GMU CGC mode | no table: `RBBM_CLOCK_CNTL_GLOBAL`, `CGC_GLOBAL_LOAD_CMD`, `CGC_P2S_TRIG_CMD`, poll `CGC_P2S_STATUS` TXDONE | different procedure, not a table swap |
 | hw_init tables | `a740_hwcg`, `a730_protect` (generated, not applied in this tree) | `a810_nonctxt_regs` (39, per pipe), `a840_gbif` (5), bicubic weights (20), UBWC fields | ready in the header; `RB_GC_GMEM_PROTECT` is written only after the secure-mode exit |
-| GMU | gen7 boot | `a6xx_gmu.c` gen8 branches (`GMU_GENERAL_8/9/10`, `CX_FAL_INTF`, RPMh power state) | next step; the GMU offsets in the header are not yet relative to the GMU window |
+| GMU | gen7 cold start (sheng `ShengGmu.c`) | gen8 branches in UniXNU-asteroids `package/ShengGmu.c` with a generated `ShengGmuSource.h`: no RSC/PDC setup or PDC window, no TCM retention, A8XX FAL and `GENERAL_8/9/10`, fence 0x8c0, `a840_gbif` + `MRC_GBIF_QOS_CTRL` | load to HFI ready done (host test); the A8xx HFI perf table is not encoded yet, so `ShengGmuColdStart` refuses gen8. NativeAdreno binds without a PDC window on gen8 |
 
 ## Not covered yet
 

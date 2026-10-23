@@ -331,22 +331,26 @@ bool NativeAdrenoGpuService::start(IOService *provider)
         if(node && published) {
             size_t gmu_core=0,gmu_pdc=NoWindow,gmu_rscc=NoWindow;
             if(!windowNamed(gmu,"gmu",&gmu_core))gmu_core=0;
-            if(!windowNamed(gmu,"gmu_pdc",&gmu_pdc))gmu_pdc=published>=3?2:1;
+            /* A8xx GMU nodes have no gmu_pdc (AOP owns the PDC); the 3a's second GMU window is gmu_ao_blk_dec0. */
+            const bool pdc_needed=regs_->generation<8;
+            if(!windowNamed(gmu,"gmu_pdc",&gmu_pdc) && pdc_needed)gmu_pdc=published>=3?2:1;
             (void)windowNamed(gmu,"rscc",&gmu_rscc);
             if(gmu_rscc>=published)gmu_rscc=NoWindow;
             /* Historical two-node layout: the GMU node lists gmu, rscc,
              * gmu_pdc and the GPU node has no rscc entry. */
             if(gmu_rscc==NoWindow && rscc_index==NoWindow && published>=2)gmu_rscc=1;
             const bool have_rscc=rscc_index!=NoWindow || gmu_rscc!=NoWindow;
-            if(gmu_core>=published || gmu_pdc>=published || !have_rscc) {
+            if(gmu_core>=published || (pdc_needed && gmu_pdc>=published) || !have_rscc) {
                 IOLog("NativeAdreno: GMU node lacks %s\n",
                     have_rscc?"the gmu/pdc windows":"the rscc window");
             } else {
                 NativeAdrenoGmuWindow gmu_windows[ShengGmuWindows]{};
                 gmu_windows[ShengGmuCore].base=node->windowAddress(gmu_core);
                 gmu_windows[ShengGmuCore].bytes=static_cast<size_t>(node->windowBytes(gmu_core));
-                gmu_windows[ShengGmuPdc].base=node->windowAddress(gmu_pdc);
-                gmu_windows[ShengGmuPdc].bytes=static_cast<size_t>(node->windowBytes(gmu_pdc));
+                if(gmu_pdc<published) {
+                    gmu_windows[ShengGmuPdc].base=node->windowAddress(gmu_pdc);
+                    gmu_windows[ShengGmuPdc].bytes=static_cast<size_t>(node->windowBytes(gmu_pdc));
+                }
                 if(rscc_index!=NoWindow) {
                     gmu_windows[ShengGmuRscc].base=
                         reinterpret_cast<volatile uint8_t *>(maps_[2]->getVirtualAddress());

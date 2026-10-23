@@ -8,7 +8,7 @@
 /* Bounds-checked MMIO adapter and time/hash services for the qualified GMU
  * cold start. Windows are exactly the five the startup uses, already mapped
  * and powered by the caller: GMU core, RSCC, PDC, the GPU register window and
- * CX misc. Every access is 4-byte aligned and inside its window; a violation
+ * CX misc (A8xx: no PDC window, passed as {nullptr,0}). Every access is 4-byte aligned and inside its window; a violation
  * returns failure instead of touching another register. The adapter performs
  * no mapping, clock, reset or power action, and the services object performs
  * no I/O of its own beyond the caller-provided clock callbacks. */

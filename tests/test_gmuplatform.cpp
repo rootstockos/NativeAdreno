@@ -54,6 +54,17 @@ int main()
     std::memcpy(bad,windows,sizeof(bad));
     bad[4].bytes=sizeof(cx)-2;
     CHECK(platform.bind(bad,&io)==kIOReturnBadArgument);
+    /* A8xx: an absent PDC window ({nullptr,0}) binds, and every access to it fails; no other window may be absent. */
+    std::memcpy(bad,windows,sizeof(bad));
+    bad[ShengGmuPdc]={nullptr,0};
+    {
+        NativeAdrenoGmuPlatform gen8;ShengGmuIo gen8_io{};
+        CHECK(gen8.bind(bad,&gen8_io)==kIOReturnSuccess && gen8_io.bytes[ShengGmuPdc]==0);
+        CHECK(gen8_io.read32(gen8_io.cookie,ShengGmuPdc,0,&value)==1 && gen8_io.write32(gen8_io.cookie,ShengGmuPdc,0,1)==1);
+        CHECK(gen8_io.write32(gen8_io.cookie,ShengGmuCore,0x10,5)==0 && core[4]==5);
+    }
+    bad[ShengGmuRscc]={nullptr,0};
+    CHECK(platform.bind(bad,&io)==kIOReturnBadArgument);
     CHECK(platform.bind(nullptr,&io)==kIOReturnBadArgument);
     CHECK(platform.bind(windows,nullptr)==kIOReturnBadArgument);
     /* Services: real SHA-256 plus injected clock callbacks. */

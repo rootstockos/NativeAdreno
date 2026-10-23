@@ -31,6 +31,8 @@ IOReturn NativeAdrenoGmuPlatform::bind(const NativeAdrenoGmuWindow windows[Sheng
 {
     if(!windows || !io)return kIOReturnBadArgument;
     for(unsigned index=0;index<ShengGmuWindows;++index) {
+        /* A8xx has no GMU PDC window (AOP owns the PDC); it is passed empty and every access to it fails. */
+        if(index==ShengGmuPdc && !windows[index].base && !windows[index].bytes)continue;
         if(!windows[index].base || !windows[index].bytes ||
             (windows[index].bytes&3) || windows[index].bytes>UINT32_MAX)
             return kIOReturnBadArgument;
