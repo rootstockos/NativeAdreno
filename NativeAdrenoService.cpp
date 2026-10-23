@@ -519,6 +519,16 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                      * restore registers and WPTR writes are not fenced, so a collapse
                                      * between frames loses CP state. */
                                     inputs.enable_ifpc=0;
+#ifdef SHENG_GMU_VOTES_HAS_SKU
+                                    /* A8xx boards bin their GPU levels by the SKU code KGSL matches against
+                                     * qcom,sku-codes. It is read on the phone and passed in; without it the
+                                     * vote builder refuses rather than pick a bin. */
+                                    uint32_t sku=0;
+                                    if(PE_parse_boot_argn("native-adreno-gpu-sku",&sku,sizeof(sku))) {
+                                        inputs.sku_code=sku;inputs.sku_present=1;
+                                    } else
+                                        IOLog("NativeAdreno: votes need native-adreno-gpu-sku\n");
+#endif
                                     if(inputs.chip_id!=SHENG_GMU_VOTES_CHIP_ID)
                                         IOLog("NativeAdreno: votes built for chip 0x%08x, running 0x%08x\n",
                                             SHENG_GMU_VOTES_CHIP_ID,inputs.chip_id);
