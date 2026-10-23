@@ -183,6 +183,23 @@ struct NativeAdrenoGpuWindow {
     volatile uint8_t *base;
     size_t bytes;
 };
+#ifdef NATIVE_ADRENO_HAVE_COMMAND_DB
+/* Log the cmd-db header's version and magic words (cmd_db_header: le32 version, then the magic bytes db 30 03 0c,
+ * 0x0c0330db as a word) on every start, before any generation guard, so a board can pin the version it boots with.
+ * Read-only on the no-map reservation. Logging is not qualification: parsing still needs the pinned value as the
+ * sheng-gpu-cmddb-version boot argument. */
+static void logCommandDbHeader()
+{
+    IODeviceMemory *db=IODeviceMemory::withRange(SHENG_GMU_COMMAND_DB_BASE,8);
+    if(!db) {IOLog("NativeAdreno: command-db header did not map\n");return;}
+    OSSharedPtr<IOMemoryMap> map(db->map(kIOMapAnywhere|kIOMapInhibitCache),OSNoRetain);
+    db->release();
+    if(!map) {IOLog("NativeAdreno: command-db header did not map\n");return;}
+    const volatile uint32_t *words=reinterpret_cast<const volatile uint32_t *>(
+        static_cast<uintptr_t>(map->getVirtualAddress()));
+    IOLog("NativeAdreno: command-db header version=0x%08x magic=0x%08x (expected 0x0c0330db)\n",words[0],words[1]);
+}
+#endif
 int NativeAdrenoGpuService::gpu_read32(void *cookie,uint32_t reg,uint32_t *value)
 {
     NativeAdrenoGpuWindow *window=static_cast<NativeAdrenoGpuWindow *>(cookie);
@@ -266,6 +283,9 @@ bool NativeAdrenoGpuService::start(IOService *provider)
         IOService::stop(provider);
         return false;
     }
+#ifdef NATIVE_ADRENO_HAVE_COMMAND_DB
+    logCommandDbHeader();
+#endif
     if(profile_->generation>NativeAdrenoProfileTable::implementedGeneration) {
         /* CP init, IRQ, ring, timer and the power-up list follow regs_, but the gen8 GMU boot, clock gating and
          * hw_init (non-context list, protect, UBWC through the aperture) are not written yet. */
@@ -520,14 +540,13 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                      * between frames loses CP state. */
                                     inputs.enable_ifpc=0;
 #ifdef SHENG_GMU_VOTES_HAS_SKU
-                                    /* A8xx boards bin their GPU levels by the SKU code KGSL matches against
-                                     * qcom,sku-codes. It is read on the phone and passed in; without it the
-                                     * vote builder refuses rather than pick a bin. */
+                                    /* A8xx boards bin their GPU levels by the SoC code KGSL matches against
+                                     * qcom,sku-codes. Optional: a bin listing 0 matches any code (the 3a's
+                                     * first bin does), and without it no other bin can be chosen. */
                                     uint32_t sku=0;
                                     if(PE_parse_boot_argn("native-adreno-gpu-sku",&sku,sizeof(sku))) {
                                         inputs.sku_code=sku;inputs.sku_present=1;
-                                    } else
-                                        IOLog("NativeAdreno: votes need native-adreno-gpu-sku\n");
+                                    }
 #endif
                                     if(inputs.chip_id!=SHENG_GMU_VOTES_CHIP_ID)
                                         IOLog("NativeAdreno: votes built for chip 0x%08x, running 0x%08x\n",
