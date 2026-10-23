@@ -9,29 +9,41 @@
  *   byte offset = (offset << 2) - (gmu_base - gpu_base)
  *   SM8550 (gmu 0x03d6a000, gpu 0x03d00000): 0x7e220 - 0x6a000 = 0x14220
  *   SM7675 (gmu 0x03d68000, gpu 0x03d00000): 0x7e220 - 0x68000 = 0x16220
- *   pinned a6xx.xml      CP_ALWAYS_ON_COUNTER 0x0980 (64-bit, A6XX-A7XX)
- *     read as low at 0x0980 and high at 0x0981, as Linux gpu_read64 does.
+ *   gen8: GMU_ALWAYS_ON_COUNTER_L 0x1f840 (A8XX-)
+ *   SM7635 (gmu 0x03d37000, gpu 0x03d00000): 0x7e100 - 0x37000 = 0x47100
+ *   pinned a6xx.xml      CP_ALWAYS_ON_COUNTER 0x0980 (64-bit, A6XX-A7XX),
+ *     0x08e7 (A8XX-), read as low then high, as Linux gpu_read64 does.
+ * Both offsets come from NativeAdrenoRegisters.
  * The delta is a property of the board's register layout, so the GPU service
  * sets it from the two mapped window bases before a timer is attached. */
 enum : uint32_t {
     TimerGmuDefault = 0x14220,
-    TimerCpLow = 0x0980,
-    TimerCpHigh = 0x0981,
+    TimerDeltaDefault = 0x6a000,
     TimerRetries = 8
 };
+static const NativeAdrenoRegisters *timer_regs=NativeAdrenoRegisterTable::gen7();
+static uint32_t gmu_delta=TimerDeltaDefault;
 static uint32_t gmu_low_offset=TimerGmuDefault;
 void NativeAdrenoTimer::setGmuBaseDelta(uint32_t delta)
 {
-    gmu_low_offset=NativeAdrenoProfileTable::timerGmuLowOffset(delta);
+    gmu_delta=delta;
+    gmu_low_offset=NativeAdrenoProfileTable::timerGmuLowOffset(delta,timer_regs->gmu_always_on_low);
+}
+IOReturn NativeAdrenoTimer::setRegisters(const NativeAdrenoRegisters *regs)
+{
+    if(!regs)return kIOReturnBadArgument;
+    timer_regs=regs;
+    gmu_low_offset=NativeAdrenoProfileTable::timerGmuLowOffset(gmu_delta,regs->gmu_always_on_low);
+    return kIOReturnSuccess;
 }
 uint32_t NativeAdrenoTimer::gmuBaseDelta()
 {
-    return 0x1f888u*4u-gmu_low_offset;
+    return timer_regs->gmu_always_on_low*4u-gmu_low_offset;
 }
 uint32_t NativeAdrenoTimer::gmuLowOffset(){return gmu_low_offset;}
 uint32_t NativeAdrenoTimer::gmuHighOffset(){return gmu_low_offset+4;}
-uint32_t NativeAdrenoTimer::cpLowRegister(){return TimerCpLow;}
-uint32_t NativeAdrenoTimer::cpHighRegister(){return TimerCpHigh;}
+uint32_t NativeAdrenoTimer::cpLowRegister(){return timer_regs->cp_always_on_counter;}
+uint32_t NativeAdrenoTimer::cpHighRegister(){return timer_regs->cp_always_on_counter+1;}
 IOReturn NativeAdrenoTimer::attach(const NativeAdrenoTimeIo *io,uint32_t source)
 {
     if(attached_)return kIOReturnBusy;
@@ -50,8 +62,8 @@ IOReturn NativeAdrenoTimer::read(uint64_t *ticks) const
 {
     if(!ticks)return kIOReturnBadArgument;*ticks=0;
     if(!attached_)return kIOReturnNotReady;
-    const uint32_t low=source_==NativeAdrenoTimeGmu?gmu_low_offset:TimerCpLow;
-    const uint32_t high=source_==NativeAdrenoTimeGmu?gmu_low_offset+4:TimerCpHigh;
+    const uint32_t low=source_==NativeAdrenoTimeGmu?gmu_low_offset:cpLowRegister();
+    const uint32_t high=source_==NativeAdrenoTimeGmu?gmu_low_offset+4:cpHighRegister();
     for(unsigned attempt=0;attempt<TimerRetries;++attempt) {
         uint32_t first=0,low_word=0,second=0;
         if(io_.read32(io_.cookie,high,&first) ||

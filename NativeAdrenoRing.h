@@ -4,8 +4,9 @@
 #include <IOKit/IOTypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "NativeAdrenoRegisters.h"
 
-/* A7XX command processor ring and timestamp fence, not a scheduler.
+/* A7XX/A8XX command processor ring and timestamp fence, not a scheduler.
  * Register indices are dword offsets; the platform adds the MMIO base and
  * multiplies by four. Caller must already own an exclusive, powered GPU with
  * SQE microcode loaded (CP_SQE_INSTR_BASE), global reset released and all
@@ -46,6 +47,7 @@ enum NativeAdrenoRingFence {
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
+    const NativeAdrenoRegisters *regs_=NativeAdrenoRegisterTable::gen7();
     volatile uint32_t *ring_=nullptr,*fence_=nullptr;
     size_t ring_bytes_=0,fence_bytes_=0;
     uint64_t ring_iova_=0,fence_iova_=0;
@@ -53,6 +55,7 @@ class NativeAdrenoRing final {
     bool attached_=false,poisoned_=false,reset_pending_=false;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
+    uint32_t resetWords() const;
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
@@ -62,6 +65,9 @@ public:
     ~NativeAdrenoRing()=default;
     NativeAdrenoRing(const NativeAdrenoRing &)=delete;
     NativeAdrenoRing &operator=(const NativeAdrenoRing &)=delete;
+    /* Before attach(); the default is gen7. Gen8 moves the fence scratch and the SRAM-init registers and adds the
+     * slice SRAM init to the context entry; the PM4 framing is the same (a8xx uses a7xx_submit). */
+    IOReturn setRegisters(const NativeAdrenoRegisters *);
     /* ring_bytes is a power of two in [8KiB,1MiB]; ring_iova must be aligned
      * to ring_bytes. fence_bytes >=64 and fence_iova 8-aligned. The fence page
      * layout is: +0 CP read-pointer shadow, +4 completed timestamp, +8 spare.

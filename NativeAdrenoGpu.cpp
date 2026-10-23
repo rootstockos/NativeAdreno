@@ -20,6 +20,9 @@ IOReturn NativeAdrenoGpu::start(const NativeAdrenoGpuBoard *board,
         !config->fence || !config->sqe_iova || !config->pwrup_reglist_iova ||
         !config->clock.now_us || !config->start_timeout_us)
         return kIOReturnBadArgument;
+    const NativeAdrenoRegisters *regs=config->regs?config->regs:NativeAdrenoRegisterTable::gen7();
+    if(ring_.setRegisters(regs) || cp_.setRegisters(regs) || irq_.setRegisters(regs) ||
+        NativeAdrenoTimer::setRegisters(regs))return kIOReturnBadArgument;
     started_=true;board_=*board;
     IOReturn status=board_.reserve(board_.cookie);
     if(status) {failed_=true;return status;}

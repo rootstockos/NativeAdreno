@@ -4,14 +4,13 @@
 #include <IOKit/IOLib.h>
 
 /* Pinned definitions: CP_SQE_INSTR_BASE is the 64-bit register at dword offset
- * 0x0830 for A6XX..A7XX (a6xx.xml). CP_THREAD_CONTROL is opcode 0x17 with
+ * 0x0830 for A6XX..A7XX and 0x0816 for A8XX (a6xx.xml, via NativeAdrenoRegisters). CP_THREAD_CONTROL is opcode 0x17 with
  * CONCURRENT_BIN_DISABLE at bit 27, and CP_ME_INIT is opcode 0x48 with seven
  * payload words (adreno_pm4.xml). The payload values are a7xx_cp_init in
  * a6xx_gpu.c: mask BIT(0)|BIT(1)|BIT(3)|BIT(6)|BIT(8), three hardware
  * contexts, 0x20000000 error detection, 0x00000002 operation mode, the
  * power-up register list address and BIT(31) to read it. */
 enum : uint32_t {
-    CpSqeInstrBase = 0x0830,
     CpThreadControlOpcode = 0x17,
     CpMeInitOpcode = 0x48,
     CpConcurrentBinDisable = 1u << 27,
@@ -21,6 +20,12 @@ enum : uint32_t {
 IOReturn NativeAdrenoCpInit::poison()
 {
     poisoned_=true;return kIOReturnIOError;
+}
+IOReturn NativeAdrenoCpInit::setRegisters(const NativeAdrenoRegisters *regs)
+{
+    if(done_ || poisoned_)return kIOReturnNotReady;
+    if(!regs)return kIOReturnBadArgument;
+    regs_=regs;return kIOReturnSuccess;
 }
 uint32_t NativeAdrenoCpInit::meInitMask()
 {
@@ -36,6 +41,7 @@ IOReturn NativeAdrenoCpInit::run(const NativeAdrenoRingIo *io,NativeAdrenoRing *
         config->sqe_iova>=UINT64_C(1)<<48 || !config->pwrup_reglist_iova ||
         (config->pwrup_reglist_iova&3) || config->pwrup_reglist_iova>=UINT64_C(1)<<48)
         return kIOReturnBadArgument;
+    const uint32_t CpSqeInstrBase=regs_->cp_sqe_instr_base;
     if(config->sqe_base_programmed) {
         uint32_t lo=0,hi=0;
         if(!io->read32 || io->read32(io->cookie,CpSqeInstrBase,&lo) || io->read32(io->cookie,CpSqeInstrBase+1,&hi) ||

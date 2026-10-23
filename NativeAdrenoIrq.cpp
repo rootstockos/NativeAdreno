@@ -2,17 +2,11 @@
 #include "NativeAdrenoIrq.h"
 #include <IOKit/IOLib.h>
 
-/* Register offsets and bit positions are the pinned Linux definitions in
- * registers/adreno/a6xx.xml: RBBM_INT_0_STATUS 0x0201, RBBM_INT_CLEAR_CMD
- * 0x0037, RBBM_INT_0_MASK 0x0038, CP_INTERRUPT_STATUS 0x0823 and
- * CP_PROTECT_STATUS 0x0824, plus the A7XX_INT_MASK enable set from
- * a6xx_gpu.c. No bit is inferred beyond those sources. */
+/* Register offsets and the enable and known sets are the pinned Linux definitions, per generation, in
+ * NativeAdrenoRegisters (gen7: RBBM_INT_0_STATUS 0x0201, RBBM_INT_CLEAR_CMD 0x0037, RBBM_INT_0_MASK 0x0038,
+ * CP_INTERRUPT_STATUS 0x0823, CP_PROTECT_STATUS 0x0824 and A7XX_INT_MASK). The bit positions below are shared by the
+ * A7XX and A8XX RBBM_INT_0 layouts (a6xx.xml A6XX_RBBM_INT_0_MASK). No bit is inferred beyond those sources. */
 enum : uint32_t {
-    IrqRbbmStatus = 0x0201,
-    IrqRbbmClear = 0x0037,
-    IrqRbbmMask = 0x0038,
-    IrqCpStatus = 0x0823,
-    IrqCpProtect = 0x0824,
     IrqBitIdle = 1u << 0,
     IrqBitAhb = 1u << 1,
     IrqBitAtbAsync = 1u << 6,
@@ -39,30 +33,23 @@ enum : uint32_t {
     IrqBitIsdbCpu = 1u << 30,
     IrqBitIsdbDebug = 1u << 31
 };
-/* Every A7XX status bit that this decoder knows and may clear. */
-static constexpr uint32_t kKnown = IrqBitIdle | IrqBitAhb | IrqBitAtbAsync | IrqBitGpc |
-    IrqBitCpSw | IrqBitCpHw | IrqBitCpCcuDepth | IrqBitCpCcuColor | IrqBitCpCcuResolve |
-    IrqBitCpIb1 | IrqBitCpIb2 | IrqBitCpPm4 | IrqBitCpPm4Lpac | IrqBitCpRbDone |
-    IrqBitCpWtDone | IrqBitCpFence | IrqBitCpFenceLpac | IrqBitAtbBus | IrqBitHang |
-    IrqBitUcheOob | IrqBitUcheTrap | IrqBitTsbWrite | IrqBitFuse | IrqBitIsdbCpu |
-    IrqBitIsdbDebug;
-/* A7XX_INT_MASK from the pinned a6xx_gpu.c. */
-static constexpr uint32_t kEnable = IrqBitAhb | IrqBitAtbAsync | IrqBitGpc | IrqBitCpSw |
-    IrqBitCpHw | IrqBitCpPm4 | IrqBitCpRbDone | IrqBitCpFence | IrqBitAtbBus |
-    IrqBitHang | IrqBitUcheOob | IrqBitUcheTrap | IrqBitTsbWrite | IrqBitFuse;
-/* CP_INTERRUPT_STATUS error bits, including the A7XX LPAC/BV replicas. */
-static constexpr uint32_t kCpErrors = 0x3fff7u;
 IOReturn NativeAdrenoIrq::poison()
 {
     poisoned_=true;return kIOReturnIOError;
 }
 uint32_t NativeAdrenoIrq::mask()
 {
-    return kEnable;
+    return NativeAdrenoRegisterTable::gen7()->int_enable;
+}
+IOReturn NativeAdrenoIrq::setRegisters(const NativeAdrenoRegisters *regs)
+{
+    if(attached_ || poisoned_)return kIOReturnBusy;
+    if(!regs)return kIOReturnBadArgument;
+    regs_=regs;return kIOReturnSuccess;
 }
 uint32_t NativeAdrenoIrq::cpErrorMask()
 {
-    return kCpErrors;
+    return NativeAdrenoRegisterTable::gen7()->cp_fault_errors;
 }
 IOReturn NativeAdrenoIrq::attach(const NativeAdrenoRingIo *io)
 {
@@ -81,9 +68,10 @@ IOReturn NativeAdrenoIrq::programMask(uint32_t *programmed)
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(programmed)*programmed=0;
     uint32_t readback=0;
-    if(io_.write32(io_.cookie,IrqRbbmMask,kEnable))return poison();
-    if(io_.read32(io_.cookie,IrqRbbmMask,&readback))return poison();
-    if(readback!=kEnable)return poison();
+    const uint32_t enable=regs_->int_enable;
+    if(io_.write32(io_.cookie,regs_->rbbm_int_mask,enable))return poison();
+    if(io_.read32(io_.cookie,regs_->rbbm_int_mask,&readback))return poison();
+    if(readback!=enable)return poison();
     enabled_=readback;
     if(programmed)*programmed=readback;
     return kIOReturnSuccess;
@@ -94,9 +82,9 @@ IOReturn NativeAdrenoIrq::handle(NativeAdrenoIrqResult *result)
     *result={};
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     uint32_t status=0;
-    if(io_.read32(io_.cookie,IrqRbbmStatus,&status))return poison();
+    if(io_.read32(io_.cookie,regs_->rbbm_int_status,&status))return poison();
     /* Linux acknowledges the whole read status before decoding it. */
-    if(io_.write32(io_.cookie,IrqRbbmClear,status))return poison();
+    if(io_.write32(io_.cookie,regs_->rbbm_int_clear,status))return poison();
     if(io_.barrier(io_.cookie))return poison();
     uint32_t flags=0,cp_status=0,protect=0;
     if(status&IrqBitCpFence)flags|=NativeAdrenoIrqFence;
@@ -107,13 +95,25 @@ IOReturn NativeAdrenoIrq::handle(NativeAdrenoIrqResult *result)
     if(status&(IrqBitAhb|IrqBitGpc|IrqBitAtbAsync|IrqBitAtbBus))flags|=NativeAdrenoIrqBusError;
     if(status&(IrqBitTsbWrite|IrqBitFuse))flags|=NativeAdrenoIrqSecurity;
     if(status&IrqBitCpHw) {
-        if(io_.read32(io_.cookie,IrqCpStatus,&cp_status))return poison();
-        if(cp_status&kCpErrors) {
-            if(io_.read32(io_.cookie,IrqCpProtect,&protect))return poison();
+        if(io_.read32(io_.cookie,regs_->cp_fault_status,&cp_status))return poison();
+        if(cp_status&regs_->cp_fault_errors) {
+            if(!regs_->aperture) {
+                if(io_.read32(io_.cookie,regs_->cp_fault_detail,&protect))return poison();
+            } else {
+                /* a8xx_cp_hw_err_irq: the pipe from the global bits, BR first, then its HW or SW detail register. */
+                const uint32_t pipe=cp_status&regs_->cp_fault_br?1u:cp_status&regs_->cp_fault_bv?2u:0u;
+                if(pipe) {
+                    const uint32_t detail=cp_status&regs_->cp_fault_hw?regs_->cp_fault_detail:
+                        regs_->cp_fault_detail_sw;
+                    if(io_.write32(io_.cookie,regs_->aperture,pipe<<regs_->aperture_pipe_shift) ||
+                        io_.read32(io_.cookie,detail,&protect) ||
+                        io_.write32(io_.cookie,regs_->aperture,0))return poison();
+                }
+            }
             flags|=NativeAdrenoIrqCpError;
         }
     }
-    const uint32_t unknown=status&~kKnown;
+    const uint32_t unknown=status&~regs_->int_known;
     if(unknown)flags|=NativeAdrenoIrqUnknown;
     if(flags&(NativeAdrenoIrqHang|NativeAdrenoIrqCpError|NativeAdrenoIrqUche|
         NativeAdrenoIrqBusError|NativeAdrenoIrqSecurity|NativeAdrenoIrqUnknown))

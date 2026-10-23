@@ -11,6 +11,14 @@ wrong registers, not just miss:
 - 0x0830, the gen7 `CP_SQE_INSTR_BASE`, is `CP_SCRATCH_PIPE(0)` on gen8;
 - 0x0808, the gen7 `CP_SQE_CNTL`, is `CP_RB_RPTR_ADDR_BV` on gen8.
 
+## Status
+
+CP init, IRQ, ring, timer and the power-up list now take their registers from `NativeAdrenoRegisters.h` (gen7 and
+gen8 tables; `NativeAdrenoRegisterTable::forGeneration`). The service picks the table from the profile's generation
+and hands it to each module before it attaches. `tests/test_gen8.cpp` runs those modules on the gen8 table over a
+register peer that models the aperture, and the existing tests still pass on the gen7 default. The start guard
+remains: the rows below from *Clock gating* down are not written yet.
+
 ## Per module
 
 | Module | Gen7 (A740) | Gen8 (A810) | Change |

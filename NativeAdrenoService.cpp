@@ -59,6 +59,7 @@ class NativeAdrenoGpuService : public IOService {
     OSDeclareDefaultStructors(NativeAdrenoGpuService)
     OSSharedPtr<IOMemoryMap> maps_[4];
     const NativeAdrenoProfile *profile_=nullptr;
+    const NativeAdrenoRegisters *regs_=nullptr;
     NativeAdrenoGmuContext gmu_ctx_;
     NativeAdrenoGmuPlatform gmu_platform_;
     ShengGmuIo gmu_io_{};
@@ -259,9 +260,15 @@ bool NativeAdrenoGpuService::start(IOService *provider)
     }
     IOLog("NativeAdreno: %s chip=0x%08x GMEM=%uKiB gmu_chip=0x%08x\n",
         profile_->name,profile_->chip_id,profile_->gmem_bytes>>10,profile_->gmu_chip_id);
+    regs_=NativeAdrenoRegisterTable::forGeneration(profile_->generation);
+    if(!regs_) {
+        IOLog("NativeAdreno: %s generation %u has no register table\n",profile_->name,profile_->generation);
+        IOService::stop(provider);
+        return false;
+    }
     if(profile_->generation>NativeAdrenoProfileTable::implementedGeneration) {
-        /* Its register map, power-up lists and GMU branches differ from A7xx;
-         * running the A7xx paths on it would write the wrong registers. */
+        /* CP init, IRQ, ring, timer and the power-up list follow regs_, but the gen8 GMU boot, clock gating and
+         * hw_init (non-context list, protect, UBWC through the aperture) are not written yet. */
         IOLog("NativeAdreno: %s is generation %u; only generation %u is implemented, not starting\n",
             profile_->name,profile_->generation,NativeAdrenoProfileTable::implementedGeneration);
         IOService::stop(provider);
@@ -360,6 +367,7 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                     const uint64_t gpu_base=windows[gpu_index].base;
                     const uint32_t delta=gmu_base>gpu_base && gmu_base-gpu_base<=UINT32_MAX?
                         static_cast<uint32_t>(gmu_base-gpu_base):profile_->gmu_gpu_delta;
+                    NativeAdrenoTimer::setRegisters(regs_);
                     NativeAdrenoTimer::setGmuBaseDelta(delta);
                     IOLog("NativeAdreno: GMU five-window I/O adapter bound, delta=0x%x counter=0x%x\n",
                         delta,NativeAdrenoTimer::gmuLowOffset());
@@ -551,7 +559,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                             NativeAdrenoRingIo ring_io{&gpu_window,gpu_write32,gpu_read32,gpu_barrier};
                                             ring_cache_={&ring_mem_,&fence_mem_};
                                             NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
-                                            ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
+                                            ring_status=ring_.setRegisters(regs_);
+                                            if(!ring_status)ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
                                             if(!ring_status && sqe_bytes) {
                                                 memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
@@ -575,8 +584,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                 if(!ring_status)ring_status=vm_.map(&pwrup_mem_,1,
                                                     pwrup_iova,3,0,2,&pwrup_map_);
                                                 size_t list_bytes=0;
-                                                if(!ring_status)ring_status=NativeAdrenoPwrupList::buildA7xx(
-                                                    gpu_read32,&cp_window,
+                                                if(!ring_status)ring_status=NativeAdrenoPwrupList::build(
+                                                    regs_,gpu_read32,gpu_write32,&cp_window,
                                                     static_cast<uint8_t *>(pwrup_mem_.mapping()),
                                                     0x1000,&list_bytes);
                                                 if(!ring_status)ring_status=pwrup_mem_.publishForDevice(0,0x1000,false);
@@ -584,7 +593,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                     NativeAdrenoCpInit cp;
                                                     NativeAdrenoCpInitConfig cfg{sqe_iova,pwrup_iova,0};
                                                     uint32_t start_fence=0;
-                                                    ring_status=cp.run(&cp_io,&ring_,&cfg,&start_fence);
+                                                    ring_status=cp.setRegisters(regs_);
+                                                    if(!ring_status)ring_status=cp.run(&cp_io,&ring_,&cfg,&start_fence);
                                                     if(!ring_status) {
                                                         NativeAdrenoRingClock clock{nullptr,ring_now,nullptr};
                                                         ring_status=ring_.wait(start_fence,&clock,2000,nullptr)
@@ -592,7 +602,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                             kIOReturnSuccess:kIOReturnTimeout;
                                                     }
                                                     if(!ring_status) {
-                                                        ring_status=irq_.attach(&cp_io);
+                                                        ring_status=irq_.setRegisters(regs_);
+                                                        if(!ring_status)ring_status=irq_.attach(&cp_io);
                                                         if(!ring_status)ring_status=irq_.programMask(nullptr);
                                                     }
                                                     if(ring_status)
@@ -608,7 +619,7 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                                             core_ready_=true;
                                                         ready_=true;
                                                         IOLog("NativeAdreno: CP started, fence=%u, interrupts masked=%08x\n",
-                                                            start_fence,NativeAdrenoIrq::mask());
+                                                            start_fence,irq_.enableMask());
                                                     }
                                                 }
                                             }

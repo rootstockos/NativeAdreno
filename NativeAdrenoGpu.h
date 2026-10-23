@@ -36,6 +36,7 @@ struct NativeAdrenoGpuConfig {
     uint64_t fence_iova;
     uint64_t sqe_iova;                 /* verified SQE microcode IOVA */
     uint64_t pwrup_reglist_iova;
+    const NativeAdrenoRegisters *regs; /* the GPU's generation; nullptr is gen7 (A740/A732) */
 };
 enum { NativeAdrenoGpuSteps = 6 };
 class NativeAdrenoGpu final {

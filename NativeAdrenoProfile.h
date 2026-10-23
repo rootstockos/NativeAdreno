@@ -43,6 +43,8 @@ public:
     /* GMU always-on counter low word, inside the GPU register window, for a
      * profile whose GMU window starts `delta` bytes after the GPU window. */
     static uint32_t timerGmuLowOffset(uint32_t delta);
+    /* The same for another counter location (a6xx_gmu.xml dword): gen8 has GMU_ALWAYS_ON_COUNTER_L at 0x1f840. */
+    static uint32_t timerGmuLowOffset(uint32_t delta,uint32_t counter_dword);
 };
 
 #endif

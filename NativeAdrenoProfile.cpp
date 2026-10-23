@@ -64,9 +64,13 @@ const NativeAdrenoProfile *NativeAdrenoProfileTable::find(uint32_t chip_id)
 
 uint32_t NativeAdrenoProfileTable::timerGmuLowOffset(uint32_t delta)
 {
-    /* a6xx_gmu.xml GMU_ALWAYS_ON_COUNTER_L is dword 0x1f888 (A6XX..A7XX).
-     * The counter is read through the GPU window, so subtract the distance
-     * from the GPU base to the GMU base. */
-    const uint32_t counter=0x1f888u*4u;
+    /* a6xx_gmu.xml GMU_ALWAYS_ON_COUNTER_L is dword 0x1f888 (A6XX..A7XX). */
+    return timerGmuLowOffset(delta,0x1f888u);
+}
+uint32_t NativeAdrenoProfileTable::timerGmuLowOffset(uint32_t delta,uint32_t counter_dword)
+{
+    /* GMU offsets are based on the GPU's start address (Linux GMU_BYTE_OFFSET), so subtract the distance from the GPU
+     * base to the GMU base. */
+    const uint32_t counter=counter_dword*4u;
     return delta<counter?counter-delta:0u;
 }
