@@ -24,6 +24,20 @@ int main()
     CHECK(NativeAdrenoProfileTable::timerGmuLowOffset(a732->gmu_gpu_delta)==0x16220u);
     CHECK(a732->ubwc_version==4u && a732->highest_bank_bit==16u && a732->ubwc_swizzle==3u);
     CHECK(a732->acd && !a732->preemption && !a732->ifpc);
+    CHECK(a740->generation==7u && a732->generation==7u);
+
+    /* A810: SM7635 kgsl-3d0@3d00000 / gmu@3d37000, mainline catalog and milos UBWC. Generation 8 is recognised so
+     * the driver can name it, and refused at start: the A7xx register paths must not run on it. The GMU always-on
+     * counter offset is not checked for it; its gen8 location is part of the gen8 work. */
+    const NativeAdrenoProfile *a810=NativeAdrenoProfileTable::a810();
+    CHECK(a810 && NativeAdrenoProfileTable::find(0x44010000u)==a810);
+    CHECK(a810->chip_id==0x44010000u && a810->generation==8u && a810->gmem_bytes==0x90000u);
+    CHECK(a810->gmu_chip_id==0x8030000u && a810->gmu_cgc_mode==0u);
+    CHECK(a810->preempt_record_bytes==0x473800u && a810->gmu_gpu_delta==0x37000u);
+    CHECK(a810->ubwc_version==4u && a810->highest_bank_bit==14u && a810->ubwc_swizzle==6u);
+    CHECK(!a810->acd && a810->preemption && a810->ifpc);
+    CHECK(a810->generation>NativeAdrenoProfileTable::implementedGeneration);
+    CHECK(a740->generation<=NativeAdrenoProfileTable::implementedGeneration);
 
     /* Unknown chips are refused instead of inheriting a neighbour's values. */
     CHECK(NativeAdrenoProfileTable::find(0)==nullptr);
@@ -31,5 +45,5 @@ int main()
     CHECK(NativeAdrenoProfileTable::timerGmuLowOffset(0)==0x7e220u);
     CHECK(NativeAdrenoProfileTable::timerGmuLowOffset(0x7e220u)==0u);
     CHECK(NativeAdrenoProfileTable::timerGmuLowOffset(0x80000u)==0u);
-    std::printf("PASS: A740 and A732 exact profiles, both GMU counter offsets and 6 unknown/limit refusals\n");
+    std::printf("PASS: A740, A732 and A810 exact profiles, generation guard, both A7xx GMU counter offsets and 6 unknown/limit refusals\n");
 }

@@ -259,6 +259,14 @@ bool NativeAdrenoGpuService::start(IOService *provider)
     }
     IOLog("NativeAdreno: %s chip=0x%08x GMEM=%uKiB gmu_chip=0x%08x\n",
         profile_->name,profile_->chip_id,profile_->gmem_bytes>>10,profile_->gmu_chip_id);
+    if(profile_->generation>NativeAdrenoProfileTable::implementedGeneration) {
+        /* Its register map, power-up lists and GMU branches differ from A7xx;
+         * running the A7xx paths on it would write the wrong registers. */
+        IOLog("NativeAdreno: %s is generation %u; only generation %u is implemented, not starting\n",
+            profile_->name,profile_->generation,NativeAdrenoProfileTable::implementedGeneration);
+        IOService::stop(provider);
+        return false;
+    }
     /* The SM8550 and SM7675 GPU nodes do not list their windows in the same
      * order or under the same names: SM8550 has gpu, cx_mem; SM7675 has
      * kgsl_3d0_reg_memory, rscc, cx_dbgc, cx_misc, ... . Select by reg-names
