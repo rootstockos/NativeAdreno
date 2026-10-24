@@ -157,6 +157,43 @@ int main()
         CHECK(NativeAdrenoGmuContextPayloads(payloads)==kIOReturnNotReady && !payloads[4].bytes);
         CHECK(NativeAdrenoGmuContextPayloads(nullptr)==kIOReturnBadArgument);
     }
+#if defined(SHENG_GMU_POOL_BASE) && defined(SHENG_GMU_POOL_BYTES)
+    /* The board's reserved pool, as the asteroids build passes it (GMU_Pool 0xE6440000 + 32 MiB) over the 3a's GPU SMMU
+     * (sCR0 0x00290406, ID0 0x4c017e18, ID1 0x40000016, ID2 0x5511, read on 2026-10-24) with uke's TCR2/SCTLR readback:
+     * every payload and the table pool are wrapped over the pool in order, zeroed through a write-combined map, and
+     * nothing is allocated from the VM. */
+    {
+        reset();mmio[0]=0x00290406;mmio[0x28/4]=0x5511;peer.tbi=1;
+        const unsigned created=fixture.created,ranges=fixture.device_ranges;
+        NativeAdrenoGmuContext context;
+        NativeAdrenoGmuContextReport report;
+        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.step==NativeAdrenoGmuContext::Ready);
+        CHECK(report.output_bits==36 && report.spans==5 && report.smr==((1u<<31)|5) && (report.s2cr&0xff)==1);
+        CHECK(fixture.created==created && fixture.device_ranges==ranges+6 && fixture.last_map_options==(kIOMapAnywhere|kIOMapWriteCombineCache));
+        NativeAdrenoGmuAllocator &gmu=context.allocator();
+        const NativeAdrenoMemory *objects[6]={&gmu.icache(),&gmu.dummy(),&gmu.debug(),&gmu.log(),&gmu.hfi(),&gmu.tables()};
+        const NativeAdrenoGmuSizes sizes=NativeAdrenoGmuDefaultSizes(NativeAdrenoGmuContext::TablePages*0x1000);
+        const uint64_t bytes[6]={sizes.icache,sizes.dummy,sizes.debug,sizes.log,sizes.hfi,sizes.tables};
+        uint64_t at=SHENG_GMU_POOL_BASE;
+        for(unsigned i=0;i<6;++i) {
+            CHECK(objects[i]->spanCount()==1 && objects[i]->spans()[0].physical==at && objects[i]->bytes()==bytes[i]);
+            at+=bytes[i];
+        }
+        CHECK(at<=SHENG_GMU_POOL_BASE+SHENG_GMU_POOL_BYTES);
+        CHECK(report.ttbr0==((uint64_t(1)<<48)|gmu.tables().spans()[0].physical));
+        const NativeAdrenoGmuMemoryLayout &layout=gmu.layout();
+        CHECK(layout.icache_iova==0x4000 && layout.dummy_iova==0x60000000 && layout.debug_iova==0x60400000);
+        CHECK(layout.log_iova==0x60004000 && layout.hfi_iova==0x60008000);
+    }
+    /* A pool too small for the payloads is refused before any range is wrapped; bringUp then falls back to the VM. */
+    {
+        NativeAdrenoGmuAllocator gmu;
+        const unsigned ranges=fixture.device_ranges;
+        CHECK(gmu.adopt(SHENG_GMU_POOL_BASE,0x1000000,NativeAdrenoGmuDefaultSizes(NativeAdrenoGmuContext::TablePages*0x1000),36)==
+            kIOReturnNoResources && fixture.device_ranges==ranges);
+    }
+    std::printf("PASS: 1 GMU context on the reserved pool with the asteroids SMMU IDs and 1 short-pool refusal\n");
+#endif
     std::printf("PASS: 1 complete GMU context bring-up with exact routes and TTBR0, 1 non-FAULT S2CR, 1 ignored "
         "context write, 1 enabled-bank refusal, 1 36-bit OAS context, 1 sheng-observed ID2/TCR2 context, 2 ID2 refusals, 5 argument refusals and 1 board entry with a stuck fault status over a software SMMU peer\n");
 }

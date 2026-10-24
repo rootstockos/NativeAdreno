@@ -14,8 +14,11 @@ using IOByteCount=size_t;
 using addr64_t=uint64_t;
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
  kIOReturnNoResources=3,kIOReturnNoMemory=4,kIOReturnUnsupported=5,
- kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8;
-constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10;
+ kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8,kIOReturnNotFound=9;
+constexpr unsigned kIOMapAnywhere=1,kIOMapWriteCombineCache=0x400;
+using IODirection=unsigned;
+constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,
+ kIOMemoryPersistent=0x40000;
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */
@@ -31,6 +34,7 @@ struct MemoryFixture {
     uint64_t next_physical=0x30000000;
     size_t contiguous_limit=0;   /* nonzero: physically contiguous requests above this many bytes fail (a fragmented tablet) */
     unsigned imported=0,imports_live=0;
+    unsigned devices_live=0,device_ranges=0,maps_live=0,last_map_options=0;bool map_fail=false;   /* IODeviceMemory doubles */
     unsigned physical_calls=0;size_t physical_bytes=0;   /* NativeAdrenoMaintainPhysicalPages doubles */
     IOReturn cpu_status=kIOReturnSuccess;
     SegmentMode mode=Contiguous;
@@ -93,10 +97,12 @@ public:
         return physical;
     }
 };
+class IOMemoryMap;
 /* A user range pinned with withAddressRange/prepare: pages at a fixed physical stride (every other page), so imports are scattered. */
 class IOMemoryDescriptor {
 public:
     uint64_t address=0,bytes=0,physical_base=0;unsigned options=0;
+    void *device_raw=nullptr;   /* IODeviceMemory: host pages standing in for the physical range */
     static IOMemoryDescriptor *withAddressRange(uint64_t address,uint64_t bytes,unsigned options,task_t task) {
         if(!task || task==kernel_task || !(options&kIOMemoryMapperNone))std::abort();
         if(fixture.allocation_fail)return nullptr;
@@ -105,11 +111,34 @@ public:
     }
     IOReturn prepare() {++fixture.prepared;if(fixture.write_protected_imports && (options&1))return 2;return fixture.prepare_fail?kIOReturnIOError:kIOReturnSuccess;}
     IOReturn complete() {++fixture.completed;return fixture.complete_fail?kIOReturnIOError:kIOReturnSuccess;}
-    void release() {--fixture.imports_live;delete this;}
+    void release() {if(device_raw) {--fixture.devices_live;std::free(device_raw);} else --fixture.imports_live;delete this;}
+    IOMemoryMap *map(unsigned options);
     uint64_t getLength() {return bytes;}
     uint64_t getPhysicalSegment(size_t offset,size_t *length,unsigned options) {
         if((offset&4095) || offset>=bytes || options!=kIOMemoryMapperNone)std::abort();
         ++fixture.segment_calls;*length=4096;return physical_base+2*offset;
+    }
+};
+/* A mapping of an IODeviceMemory range: the host pages behind it, filled 0xa5 so a missed zero shows. */
+class IOMemoryMap {
+public:
+    void *va=nullptr;unsigned options=0;
+    uint64_t getVirtualAddress() {return reinterpret_cast<uintptr_t>(va);}
+    void release() {--fixture.maps_live;delete this;}
+};
+inline IOMemoryMap *IOMemoryDescriptor::map(unsigned map_options) {
+    if(!device_raw)std::abort();
+    if(fixture.map_fail)return nullptr;
+    auto *m=new IOMemoryMap;m->va=device_raw;m->options=map_options;++fixture.maps_live;fixture.last_map_options=map_options;return m;
+}
+/* withRange over an existing physical range (the board's reserved pool); no page is allocated from the VM. */
+class IODeviceMemory : public IOMemoryDescriptor {
+public:
+    static IOMemoryDescriptor *withRange(uint64_t physical,uint64_t bytes) {
+        if(fixture.allocation_fail)return nullptr;
+        auto *d=new IODeviceMemory;d->physical_base=physical;d->bytes=bytes;
+        if(posix_memalign(&d->device_raw,4096,bytes))std::abort();
+        std::memset(d->device_raw,0xa5,bytes);++fixture.devices_live;++fixture.device_ranges;return d;
     }
 };
 #endif
