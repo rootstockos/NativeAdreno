@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host run of tests/test_gmuctx.cpp: the GMU's SMMU context over a software SMMU peer, once with the VM allocator and once with
+# Host run of tests/test_gmuctx.cpp and tests/test_gpuctx.cpp: the GMU's SMMU context over a software SMMU peer, once with the VM allocator and once with
 # the asteroids GMU pool (GMU_Pool 0xE6440000 + 32 MiB) adopted. Usage: scripts/check-gmu-context-host.sh <UniXNU>/kits/ArmSmmu4K
 # On a host that is not AArch64 (this repository's Intel build host) the two inline "dsb sy" barriers, in ArmSmmu4KMmio.c and
 # NativeAdrenoMemory.cpp, become compiler fences in scratch copies; nothing else changes.
@@ -18,9 +18,11 @@ for s in ArmSmmu4KContext ArmSmmu4KProgram ArmSmmu4KLive ArmSmmu4KStreams; do
 done
 xcrun clang -std=c11 $FLAGS -I "$SMMU" -c "$OUT/ArmSmmu4KMmio.c" -o "$OUT/ArmSmmu4KMmio.o"
 build() {
+    test=$1; shift
     xcrun clang++ -std=c++23 $FLAGS -I "$OUT/inc" -I "$KIT/tests" -I "$KIT" -I "$SMMU" "$@" "$OUT/NativeAdrenoMemory.cpp" \
         "$KIT/NativeAdrenoSmmuMemory.cpp" "$KIT/NativeAdrenoVm.cpp" "$KIT/NativeAdrenoGmuMemory.cpp" "$KIT/NativeAdrenoSmmuContext.cpp" \
-        "$KIT/NativeAdrenoGmuContext.cpp" "$KIT/tests/test_gmuctx.cpp" "$OUT"/ArmSmmu4K*.o
+        "$KIT/NativeAdrenoGmuContext.cpp" "$KIT/tests/$test" "$OUT"/ArmSmmu4K*.o
 }
-build -o "$OUT/vm" && "$OUT/vm"
-build -DSHENG_GMU_POOL_BASE='UINT64_C(0xE6440000)' -DSHENG_GMU_POOL_BYTES=0x02000000u -o "$OUT/pool" && "$OUT/pool"
+build test_gmuctx.cpp -o "$OUT/vm" && "$OUT/vm"
+build test_gpuctx.cpp "$KIT/NativeAdrenoGpuContext.cpp" -o "$OUT/gpu" && "$OUT/gpu"
+build test_gmuctx.cpp -DSHENG_GMU_POOL_BASE='UINT64_C(0xE6440000)' -DSHENG_GMU_POOL_BYTES=0x02000000u -o "$OUT/pool" && "$OUT/pool"

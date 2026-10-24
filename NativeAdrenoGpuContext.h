@@ -18,6 +18,9 @@ enum : uint64_t {
     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
     GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
 };
+/* A second stream ID of GpuNoStream routes only the first: the 3a's hypervisor refuses an SMR for any GPU stream but
+ * SID 0 (SID 1 and the secure SID 2 abort), as pandora's A840 also runs on SID 0 alone. Its slot is then unused. */
+enum : uint16_t {GpuNoStream=0xffff};
 enum : size_t {GpuSqeBytes=0x20000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
 struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
 class NativeAdrenoGpuContext final {
@@ -34,7 +37,7 @@ public:
     NativeAdrenoGpuContext()=default;
     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
-    /* The report is the GMU context's: route counts cover both streams. */
+    /* The report is the GMU context's: route counts cover the routed streams (one when sids[1] is GpuNoStream). */
     IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
         const uint16_t sids[2],void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
     bool ready() const {return ready_;}
