@@ -32,10 +32,12 @@ remains: the rows below from *Clock gating* down are not written yet.
 | Protect | `CP_PROTECT(i)` 0x0850, last span at index `count_max-1` | `CP_PROTECT_GLOBAL(i)` 0x0850, last span again at `CP_PROTECT_PIPE(15)` 0x08af for BR and BV | 47 writes; control word 0xffff000b to `CP_PROTECT_CNTL_PIPE` 0x084e per pipe |
 | Clock gating | `a740_hwcg` table + GMU CGC mode | no table: `RBBM_CLOCK_CNTL_GLOBAL`, `CGC_GLOBAL_LOAD_CMD`, `CGC_P2S_TRIG_CMD`, poll `CGC_P2S_STATUS` TXDONE | different procedure, not a table swap |
 | hw_init tables | `a740_hwcg`, `a730_protect` (generated, not applied in this tree) | `a810_nonctxt_regs` (39, per pipe), `a840_gbif` (5), bicubic weights (20), UBWC fields | ready in the header; `RB_GC_GMEM_PROTECT` is written only after the secure-mode exit |
-| GMU | gen7 cold start (sheng `ShengGmu.c`) | gen8 branches in UniXNU-asteroids `package/ShengGmu.c` with a generated `ShengGmuSource.h`: no RSC/PDC setup or PDC window, no TCM retention, A8XX FAL and `GENERAL_8/9/10`, fence 0x8c0, `a840_gbif` + `MRC_GBIF_QOS_CTRL` | load to HFI ready done (host test); the A8xx HFI perf table is not encoded yet, so `ShengGmuColdStart` refuses gen8. NativeAdreno binds without a PDC window on gen8 |
+| GMU | gen7 cold start (sheng `ShengGmu.c`) | gen8 branches in UniXNU-asteroids `package/ShengGmu.c` with a generated `ShengGmuSource.h`: no RSC/PDC setup or PDC window, no TCM retention, A8XX FAL and `GENERAL_8/9/10`, fence 0x8c0, `a840_gbif` + `MRC_GBIF_QOS_CTRL` | cold start and HFI startup done in software (UniXNU-asteroids `scripts/check-asteroids-gmu.py`): the A8xx GPU_PERF table, MX dependency votes and ACV perfmode come from rootstockos/AdrenoFirmware `asteroids-a8xx`, votes from cmd-db at boot. NativeAdreno binds without a PDC window on gen8 and logs the cmd-db header |
 
 ## Not covered yet
 
-- GMU gen8 boot and HFI, RSC/PDC, and the volcano GPU CC.
+- The volcano GPU CC (clocks and GDSCs) and running the GMU path on the phone.
+- uke (A732, 2026-10-23) ran the whole staged path on hardware through the CP ring, zap/IRQ and the Metal
+  accelerator publish, with the secure SID 2 stream skipped (its SMR write aborts in the non-secure VM).
 - The 3a's ADT GPU node needs `qcom,chipid` 0x44010000 (its device tree has none).
-- Zap shader under Gunyah.
+- Zap shader under Gunyah: worked on uke's SM7675; still to see on the 3a.
