@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Runs the plugin's own Turnip smoke sequence (drivers/NativeMetal/NativeTurnipSmoke.h, the code that ships in the Metal plugin) against
+/* Runs the plugin's own Turnip smoke sequence (drivers/AdrenoMetal/NativeTurnipSmoke.h, the code that ships in the Metal plugin) against
  * the host copy of the kernel stack. The software CP executes nothing, so the fill pattern never appears: the expected outcome is that every
  * stage up to and including the fence wait passes and the run stops at stage 10 (only the untouched half of the buffer, 512 words, matches). */
 #include "NativeTurnipSmoke.h"
