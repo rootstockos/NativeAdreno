@@ -6,7 +6,8 @@
 /* The GPU's own SMMU context, built like the GMU's (NativeAdrenoGmuContext): a native4K lower-region (TTBR0) table
  * pool for a 0..2 GiB GPU space, one context bank, the GPU's two streams routed to it, then the kernel buffers the
  * command processor needs at fixed GPU addresses below the A740 GMEM window (UCHE_GMEM_RANGE_MIN 16 MiB):
- *   sqe      the SQE microcode (a740_sqe.fw without its first dword, as adreno_fw_create_bo copies it), R+X
+ *   sqe      the SQE microcode without its first dword, as adreno_fw_create_bo copies it, R+X; 128 KiB holds both
+ *            a740_sqe.fw and the A810's gen80300_sqe.fw (85,844 bytes)
  *   ring     ring buffer 0, 32 KiB, aligned to its size, R+W
  *   memptrs  msm_rbmemptrs layout: +0 rptr, +4 fence, +8 bv_rptr, +12 bv_fence, R+W
  *   pwrup    the a7xx power-up register list (cpu_gpu_lock header + pairs), R+W
@@ -17,7 +18,7 @@ enum : uint64_t {
     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
     GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
 };
-enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+enum : size_t {GpuSqeBytes=0x20000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
 struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
 class NativeAdrenoGpuContext final {
     NativeAdrenoMemory tables_,buffers_[GpuBufferCount];
