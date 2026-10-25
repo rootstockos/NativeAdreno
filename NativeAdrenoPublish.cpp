@@ -19,23 +19,14 @@
 #include <string.h>
 #include <kern/thread.h>
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoDiag.h"
 
 extern "C" void proc_selfname(char *, int);
 /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
 extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
 
 extern "C" {
-/* What the processes that reached this driver did, for the boot diagnostic page. Plain counters and short strings. */
-struct NativeAdrenoMetalDiag {
-    uint32_t opens, busy, bad, closes, reports, property_reads, foreign_opens, foreign_type, name_reads, calls, last_selector, last_status, ext_entries, ext_selector, ext_status, ext_in, ext_out, tunnel_calls, probes, sel_bits[8], mb_maps, mb_calls, marks_total, marks[16], chk_macf, chk_res, chk_type, type_pass_lo, type_pass_hi, attach_status, inflight, inflight_since_calls, forced_unmaps;
-    char opener[3][17];      /* process names of the latest connections, newest first */
-    char reader[3][17];      /* process names that read a registry property of the accelerator, newest first */
-    char name_reader[17];    /* latest process that read MetalPluginName specifically */
-    char starter[3][17];     /* processes that sent plugin marker 1 (the plugin's initWithAcceleratorPort: started), newest first */
-    char report[64];         /* the plugin's own result line (SetMetadata text), latest */
-    char report2[64];        /* the plugin's Turnip-phase line (text starting "T " or "W "), latest */
-    uint32_t grants;         /* opens granted to the render server by this driver in place of the sandbox verdict (the view in GpuPowerProbe.cpp ends before this) */
-} native_adreno_metal_diag;
+struct NativeAdrenoMetalDiag native_adreno_metal_diag;
 /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
  * resources), [4] last refusal's IOReturn, [5] threads inside now. int-115 showed a backboardd thread in IOConnectMapMemory64 ~650 times a second. */
 extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
@@ -85,16 +76,9 @@ extern const struct io_filter_callbacks *gIOUCFilterCallbacks;
 
 extern "C" volatile uint32_t native_adreno_trace_stage;
 extern "C" {
-/* One entry per IOServiceOpen of the accelerator (not markers): who, which type, what the two sandbox gates said. */
-struct NativeAdrenoOpenRecord {char name[20]; uint32_t type, macf, res, attach, foreign;};
 struct NativeAdrenoOpenRecord native_adreno_open_log[8];
 volatile uint32_t native_adreno_open_log_count;
-/* One row per process name that opened the plugin type (first eight names): opens granted, refused (sandbox, cap or no free slot),
- * closes, the slot of its live connection (0xff none), the highest GPU address its mappings reached (MiB) and its last refusal. */
-struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
 struct NativeAdrenoClientRecord native_adreno_client_log[8];
-/* The last text line (the plugin's failure reason) each process other than the render server streamed: process name and a 64-byte line. */
-struct NativeAdrenoClientText {char name[20]; char text[64];};
 struct NativeAdrenoClientText native_adreno_client_text[4];
 /* Why the latest mount of a connection failed: [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] its IOReturn; [2] the slot; [3] failures so far. */
 volatile uint32_t native_adreno_mount_fail[4];
