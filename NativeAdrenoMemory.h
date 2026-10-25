@@ -64,6 +64,9 @@ public:
      * BoMap failed, the translator answered out of device memory and the compositor fell back to the CPU; each map also walked every span, 167 ms).
      * allocate(..., pooled=true) uses the pool when one is reserved and has room, else the scattered path. Only the board calls this. */
     static IOReturn reservePool(unsigned output_bits,size_t bytes);
+    /* The pool over RAM the loader kept from XNU (a fixed physical range outside XNU's window) instead of reservePool's VM block:
+     * wrapped as device memory and mapped write-combined for good. Board only, once, before any BO is allocated. */
+    static IOReturn adoptPool(uint64_t physical,size_t bytes,unsigned output_bits);
     static size_t poolBytes();
     /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
      * Board only, after reservePool, when user BOs are write-combined. */

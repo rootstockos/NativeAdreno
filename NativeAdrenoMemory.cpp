@@ -20,9 +20,12 @@ namespace {
 struct PoolExtent {size_t offset,bytes;};
 struct Pool {
     IOBufferMemoryDescriptor *descriptor=nullptr;
+    /* adoptPool: RAM the loader kept from XNU, wrapped as device memory and mapped write-combined for good. */
+    IOMemoryDescriptor *adopted=nullptr;IOMemoryMap *map=nullptr;
     unsigned char *virt=nullptr;uint64_t physical=0;size_t bytes=0,used=0,peak=0;
     PoolExtent free[512];unsigned count=0;
     bool write_combined=false;
+    bool live() const {return descriptor || adopted;}
 } pool;
 bool poolTake(size_t bytes,size_t *offset) {
     int best=-1;
@@ -60,7 +63,7 @@ size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
  * its pages take the attribute once here and keep it while the pool lives. */
 IOReturn NativeAdrenoMemory::writeCombinePool()
 {
-    if(!pool.descriptor || !pool.virt || !pool.bytes)return kIOReturnNotReady;
+    if(!pool.live() || !pool.virt || !pool.bytes)return kIOReturnNotReady;
     if(pool.write_combined)return kIOReturnSuccess;
     IOReturn status=NativeAdrenoMaintainOwnedPages(pool.virt,pool.bytes,NativeAdrenoCleanInvalidate);
     if(status)return status;
@@ -71,7 +74,7 @@ IOReturn NativeAdrenoMemory::writeCombinePool()
 }
 IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
 {
-    if(pool.descriptor)return kIOReturnBusy;
+    if(pool.live())return kIOReturnBusy;
     if(!bytes || (bytes&4095) || !outputWidth(bits))return kIOReturnBadArgument;
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
@@ -95,6 +98,34 @@ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
     native_adreno_pool_stats[0]=(uint32_t)(bytes>>20);
     return kIOReturnSuccess;
 }
+/* pandora's patch 0178 and uke's GMU pool: on a board whose loader gives XNU only part of DRAM, the BO pool is RAM the
+ * loader kept out of XNU's window, at a fixed physical range, instead of a contiguous block XNU no longer has once userland
+ * runs. It is wrapped as device memory (IODeviceMemory::withRange, as adopt() wraps the GMU pool) and mapped write-combined
+ * once, for good: outside XNU's DRAM there is no cacheable alias, so the pool is write-combined from the start and its BOs
+ * are zeroed with stores (no DC ZVA, no cache maintenance by VA, as adopt() does). */
+IOReturn NativeAdrenoMemory::adoptPool(uint64_t physical,size_t bytes,unsigned bits)
+{
+    if(pool.live())return kIOReturnBusy;
+    if(!physical || !bytes || ((physical|bytes)&4095) || physical>UINT64_MAX-bytes || !outputWidth(bits))return kIOReturnBadArgument;
+    NativeAdrenoCpuState cpu{};
+    IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+    const uint64_t limit=UINT64_C(1)<<bits;
+    if(physical>=limit || bytes>limit-physical)return kIOReturnBadArgument;
+    IOMemoryDescriptor *memory=IODeviceMemory::withRange(physical,bytes);
+    if(!memory)return kIOReturnNoMemory;
+    status=memory->prepare();
+    if(status!=kIOReturnSuccess) {memory->release();return status;}
+    IOMemoryMap *map=memory->map(kIOMapAnywhere|kIOMapWriteCombineCache);
+    unsigned char *virt=map?reinterpret_cast<unsigned char *>(static_cast<uintptr_t>(map->getVirtualAddress())):nullptr;
+    if(!virt || ((uintptr_t)virt&4095) || memory->getLength()!=bytes) {
+        if(map)map->release();
+        (void)memory->complete();memory->release();return kIOReturnUnsupported;
+    }
+    pool.adopted=memory;pool.map=map;pool.virt=virt;pool.physical=physical;pool.bytes=bytes;pool.used=pool.peak=0;
+    pool.free[0]={0,bytes};pool.count=1;pool.write_combined=true;
+    native_adreno_pool_stats[0]=(uint32_t)(bytes>>20);
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
@@ -104,7 +135,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     uint64_t limit=UINT64_C(1)<<bits;
-    if(pooled && pool.descriptor && bytes<=pool.bytes) {
+    if(pooled && pool.live() && bytes<=pool.bytes) {
         size_t offset=0;
         if(poolTake(bytes,&offset)) {
             const uint64_t physical=pool.physical+offset;
@@ -114,7 +145,10 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
                 if(!spans_) {poolGive(offset,bytes);return kIOReturnNoMemory;}
                 span_capacity_=1;span_count_=1;spans_[0]={0,physical,bytes};
                 mapping_=pool.virt+offset;bytes_=bytes;pooled_=true;pool_offset_=offset;prepared_=true;
-                bzero(mapping_,bytes);
+                if(pool.adopted) {
+                    volatile uint64_t *words=static_cast<volatile uint64_t *>(mapping_);
+                    for(size_t at=0;at<bytes/sizeof(uint64_t);++at)words[at]=0;
+                } else bzero(mapping_,bytes);
                 /* Through a write-combined pool's own mapping the zeros go to DRAM; the barrier completes them. */
                 if(pool.write_combined)__asm__ volatile("dsb sy":::"memory");
                 else status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
