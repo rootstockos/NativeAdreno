@@ -24,6 +24,10 @@ struct NativeAdrenoRingIo {
     int (*write32)(void *,uint32_t reg,uint32_t value);
     int (*read32)(void *,uint32_t reg,uint32_t *value);
     int (*barrier)(void *);
+    /* Optional: the GMU's AHB fence status (bit 0: a write to a fenced GPU register was dropped while the GPU power domain was not
+     * ready); with clear set, also clears it. Without it, WPTR writes are not checked. */
+    void *fence_cookie;
+    int (*fence_status)(void *,int clear,uint32_t *status);
 };
 struct NativeAdrenoRingCache {
     void *cookie;
@@ -44,6 +48,7 @@ enum NativeAdrenoRingFence {
     NativeAdrenoRingFencePoisoned,
     NativeAdrenoRingFenceArgument
 };
+enum : uint32_t {NativeAdrenoRingStallWords = 22};   /* NativeAdrenoRing::stallState */
 class NativeAdrenoRing final {
     NativeAdrenoRingIo io_{};
     NativeAdrenoRingCache cache_{};
@@ -53,7 +58,9 @@ class NativeAdrenoRing final {
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    uint32_t context_=0;
     IOReturn poison();
+    IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
     uint32_t resetWords() const;
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
@@ -88,6 +95,11 @@ public:
     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
     void requestContextReset() {reset_pending_=true;}
+    /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the
+     * submitting context differs from the ring's last one, the next framed prologue carries the context entry. Turnip's BR/BV barriers
+     * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
+     * counters to the next, and the threads waited on each other for good (int-249..254: BR in a later IB than BV, no fault). */
+    void useContext(uint32_t context) {if(context!=context_) {context_=context;reset_pending_=true;}}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,
@@ -97,6 +109,20 @@ public:
      * this ring issued are accepted. Never writes a register. */
     NativeAdrenoRingFence observeFence(uint32_t fence,const NativeAdrenoRingClock *,
         uint32_t timeout_us,uint32_t *observed);
+    /* Reads the CP's state for a fence that stopped advancing into out[NativeAdrenoRingStallWords]: RBBM_STATUS..STATUS3,
+     * RBBM_INT_0_STATUS, CP_HW_FAULT, CP_STATUS_1, CP_PROTECT_STATUS, CP_RB_RPTR, CP_RB_WPTR, CP_IB1_BASE (lo, hi),
+     * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
+     * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
+    IOReturn stallState(uint32_t *out);
+    /* Writes CP_RB_WPTR again with the value already published: for a CP that went idle with work in the ring (a lost write pointer
+     * notification); harmless when the CP already saw it. */
+    IOReturn kick();
+    /* a6xx_bus_clear_pending_transactions without the GX side: GBIF client requests halted, then all AXI requests, each until its
+     * acknowledge or a bounded spin, then the halt cleared. ack[0] and ack[1] are the acknowledge words (bit 0 client, bit 1 arbiter). */
+    IOReturn drainBus(uint32_t *ack);
+    /* The CP_INDIRECT_BUFFER packet that ends just before ring index rptr (what a thread whose read pointer is rptr executes): its GPU
+     * address and size in dwords. kIOReturnUnsupported when the words there are not that packet. */
+    IOReturn ibBefore(uint32_t rptr,uint64_t *iova,uint32_t *dwords) const;
     bool poisoned() const {return poisoned_;}
     uint32_t outstanding() const {return seqno_-completed_;}
     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */

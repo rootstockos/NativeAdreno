@@ -145,6 +145,8 @@ class AGXDeviceUserClient : public IOUserClient {
      * cached makes IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
     enum {MaxViews=NativeAdrenoClientMaxObjects};
+    /* A token is its BO's entry index plus one, so it names its own slot (a walk over every slot ran on each CPU map and unmap). */
+    View *viewSlot(uint32_t token) {return views_ && token && token<=MaxViews?&views_[token-1]:nullptr;}
     View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
     void dropViews(uint32_t token);
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
@@ -261,7 +263,8 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
     for(;;) {
         IOMemoryDescriptor *view=nullptr;
         IOLockLock(g.lock);
-        if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor && (!token || v.token==token)) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+        if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;v->descriptor=nullptr;v->token=0;}}
+        else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
         IOLockUnlock(g.lock);
         if(!view)return;
         /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
@@ -332,8 +335,9 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     IOLockLock(g.lock);
     if(!views_)views_=IONewZero(View,MaxViews);
     if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
-    for(size_t i=0;i<MaxViews;++i)if(views_[i].descriptor && views_[i].token==type) {
-        views_[i].descriptor->retain();*memory=views_[i].descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
+    View *v=viewSlot(type);
+    if(v && v->descriptor && v->token==type) {
+        v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
         IOLockUnlock(g.lock);
         return kIOReturnSuccess;
@@ -361,7 +365,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
                 if(!descriptor)status=kIOReturnNoMemory;
                 else {
                     bool cached=false;
-                    for(size_t i=0;i<MaxViews;++i)if(!views_[i].descriptor) {views_[i].token=type;views_[i].descriptor=descriptor;descriptor->retain();cached=true;break;}
+                    if(v && !v->descriptor) {v->token=type;v->descriptor=descriptor;descriptor->retain();cached=true;}
                     if(!cached) {
                         /* Never hand out a view that cannot be torn down again. */
                         descriptor->release();

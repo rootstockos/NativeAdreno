@@ -5,6 +5,7 @@
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoStatus.h"
+#include "NativeAdrenoHandleIndex.h"
 
 /* Kernel-side body of the Adreno user client, deliberately free of IOKit so it
  * can be exercised on a host. The future IOService/IOUserClient wrapper only
@@ -13,7 +14,8 @@
  * pointer values. A mapping is retirable only through freeBo, which unmaps
  * first and then releases the backing object; both steps must succeed.
  * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
-enum : size_t {NativeAdrenoClientMaxObjects=4096,NativeAdrenoClientContiguousFirstBytes=65536};
+/* As many objects as the shared VM table can hold (NativeAdrenoVmMaxObjects; i567: backboardd crashed twice at 4096). */
+enum : size_t {NativeAdrenoClientMaxObjects=16384,NativeAdrenoClientContiguousFirstBytes=65536};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
@@ -33,6 +35,8 @@ class NativeAdrenoUserClient final {
     /* Allocated at open(), all-zero is the free state. */
     Entry *entries_=nullptr;
     size_t entry_count_=0;
+    NativeAdrenoHandleIndex<NativeAdrenoClientMaxObjects> index_;   /* live handle -> its entries_ index */
+    size_t free_hint_=0,live_=0;   /* no free entry below free_hint_; live_ entries are used */
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
@@ -44,16 +48,20 @@ class NativeAdrenoUserClient final {
     /* Scope on the shared ring and GPU space: this client's queues are the submit object's queues [queue_base_, +MaxQueues), and with a
      * window (window_bytes_ nonzero) every mapping must lie inside [window_start_, +window_bytes_), which GetDeviceInfo reports as the VA. */
     uint32_t queue_base_=0;
+    uint32_t context_=0;   /* this client's GPU context for NativeAdrenoRing::useContext */
     /* A client owns a queue range once setScope() gave it one or it has submitted into the default one (a single client that never scopes owns
      * range 0). Before either, queue_base_ is only the default 0, which a scoped client may own, so a check of "this client's own range" would
      * test someone else's jobs. */
     bool scoped_=false,used_=false;
+    NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};   /* submit()'s list: too large for the kernel stack */
+    NativeAdrenoAbiSubmit submit_request_{};   /* the submit request as copied in, for the same reason */
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
     Entry *find(uint64_t);
     Entry *free();
-    static void clear(Entry &);
+    void clear(Entry &);
+    void publish(Entry &);
 public:
     NativeAdrenoUserClient()=default;
     ~NativeAdrenoUserClient()=default;

@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_VM_H
 #include "NativeAdrenoSmmuMemory.h"
 #include "ArmSmmu4KStreams.h"
+#include "NativeAdrenoHandleIndex.h"
 struct NativeAdrenoVmRegion {
     NativeAdrenoMemory *tables;
     ArmSmmu4KLiveArena *arena;
@@ -27,8 +28,9 @@ struct NativeAdrenoVmResult {
  * No VM may be advertised to apps until per-client isolation, submission
  * validation/protection, genuine IRQ fences and reset are implemented. */
 /* One table for every client's mappings: 1024 filled up once the render server primed its shaders (int-237: BoMap refused with
- * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed). */
-enum : size_t {NativeAdrenoVmMaxObjects=4096};
+ * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed), and 4096 after a few app
+ * switches (i567: both backboardd crashes came at objects=4096, after it held about 4000 for minutes). */
+enum : size_t {NativeAdrenoVmMaxObjects=16384};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -45,6 +47,11 @@ class NativeAdrenoVm final {
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
     };
     Mapping *mappings_=nullptr;
+    NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+    size_t free_hint_=0;   /* no free mappings_ slot below it */
+    size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
+    size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
+    size_t import_spans_[16]{};   /* the imported mappings' ranges per alias class */
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
     ArmSmmu4KIo io_{};
@@ -65,9 +72,12 @@ class NativeAdrenoVm final {
     unsigned since_audit_=0;
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
+    const Mapping *find(uint64_t) const;
+    size_t rangeAt(uint64_t iova) const;
     void insert(size_t,unsigned);
     void erase(size_t,size_t,unsigned);
-    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned) const;
+    IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,bool exclusive) const;
+    bool exclusivePages(const NativeAdrenoMemory *,unsigned cls) const;
 public:
     NativeAdrenoVm()=default;
     ~NativeAdrenoVm()=default;
@@ -115,6 +125,14 @@ public:
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
+     * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
+    IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
+    IOReturn faultState(uint32_t out[4]) const;
+    /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
+    uint64_t nextHandle() const {return next_handle_;}
+    uint64_t handleAt(uint64_t iova) const;
     /* Only a scheduler's actual successful GPU completion may call this.
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);

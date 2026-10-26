@@ -68,6 +68,8 @@ public:
      * wrapped as device memory and mapped write-combined for good. Board only, once, before any BO is allocated. */
     static IOReturn adoptPool(uint64_t physical,size_t bytes,unsigned output_bits);
     static size_t poolBytes();
+    /* The pool's first physical byte (0 without a pool): its pages belong to pooled BOs alone. */
+    static uint64_t poolPhysical();
     /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
      * Board only, after reservePool, when user BOs are write-combined. */
     static IOReturn writeCombinePool();
@@ -82,6 +84,7 @@ public:
      * reserved from the kernel allocator (UEFI memory map / ADT reserved-memory), so the pages are
      * here for good and never alias VM allocations. One contiguous span; the CPU mapping is kept. */
     IOReturn adopt(uint64_t physical,size_t bytes,unsigned output_bits,size_t byte_budget);
+    bool pooled() const {return pooled_;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     /* After allocate(), before any device or client mapping: cleans and invalidates the pages and makes every CPU mapping of them

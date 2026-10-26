@@ -18,7 +18,7 @@ constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
 constexpr unsigned kIOMapAnywhere=1,kIOMapWriteCombineCache=0x400;
 using IODirection=unsigned;
 constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,
- kIOMemoryPersistent=0x40000;
+ kIOMemoryPersistent=0x10000;
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */
