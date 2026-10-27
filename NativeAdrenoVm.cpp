@@ -16,6 +16,11 @@ static bool coherentMapping(unsigned writeback) {return writeback && native_adre
  * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
  * maintenance per submission, which cost about 60 ms per frame. */
 static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->imported() && native_adreno_io_coherent;}
+/* asteroids test switch (the board sets it from sheng-gpu-import-skip, default 0): imports are not cleaned before each submission even
+ * without IO coherence. Their clean at map time stands; GPU writes are still made visible to the CPU at completion (acquireImported).
+ * A surface the CPU draws into after it was mapped can then reach the GPU stale. On the 3a, coherence is off and the per-submission
+ * clean of every import cost about 100 MiB and 4.2 ms per submission (T40e2). */
+extern "C" {volatile uint32_t native_adreno_import_skip;}
 static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
 {return a<b+bb && b<a+ab;}
 /* Mappings of one cache/shareability/privilege class may share pages; only pages shared across classes refuse. */
@@ -421,7 +426,9 @@ IOReturn NativeAdrenoVm::publishMapped()
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
         if(!m.memory)continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+        if(coherentMapping(m.writeback) || importedUntouched(m.memory) || (native_adreno_import_skip && m.memory->imported())) {
+            native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;
+        }
         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
     }
     return kIOReturnSuccess;
