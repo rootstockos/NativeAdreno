@@ -324,13 +324,16 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     clear(*entry);
     return kIOReturnSuccess;
 }
+/* asteroids: the submit's reserved word carries the client's own count of what the submission asks of the GPU (the asteroids Turnip
+ * patch turnip-asteroids-stats.patch: passes, system-memory passes, blits, draws / 4, render-area megapixels), kept by fence for the
+ * board, which adds the submission's GPU time to it. Zero from any other client. */
+extern "C" {volatile uint32_t native_adreno_submit_stats[256];}
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     NativeAdrenoAbiSubmitReply *reply,const NativeAdrenoRingClock *clock)
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->fence=0;
     if(!open_)return kIOReturnNotReady;
-    if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
-        request->reserved)return kIOReturnBadArgument;
+    if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers)return kIOReturnBadArgument;
     if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active)
         return kIOReturnBadArgument;
     if(request->wait_fence) {
@@ -357,6 +360,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
         queue_base_+static_cast<uint32_t>(request->queue),&fence);
     vm_->setOwner(0);
     if(status)return status;
+    native_adreno_submit_stats[fence&255]=request->reserved;
     reply->fence=fence;
     return kIOReturnSuccess;
 }

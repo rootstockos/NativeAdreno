@@ -79,7 +79,7 @@ struct NativeAdrenoAbiSubmitBuffer {
 };
 struct NativeAdrenoAbiSubmit {
     uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
-    uint32_t reserved;            /* zero */
+    uint32_t reserved;            /* asteroids: the client's per-submission counts (see NativeAdrenoUserClient::submit); not checked */
     uint64_t queue;               /* open queue; 0 is created by open() */
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
