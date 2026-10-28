@@ -647,10 +647,20 @@ IOReturn NativeAdrenoUserClient::closeQueue(const NativeAdrenoAbiQueue *request)
     queue={};
     return kIOReturnSuccess;
 }
+/* asteroids: GPU time per kind of work, from the asteroids Turnip patch (turnip-asteroids-timing.patch): a SetMetadata call tagged
+ * 'TIME' in reserved, with no object, carries [0..5] microseconds and [6..11] counts of GMEM passes, system-memory passes, blits,
+ * copies, resolves and image clears, [12] command buffers, [13] brackets that never ran, [14] dropped; added up here for the board. */
+extern "C" {volatile uint32_t native_adreno_optime[15];}
 IOReturn NativeAdrenoUserClient::setMetadata(const NativeAdrenoAbiMetadata *request)
 {
     if(!request)return kIOReturnBadArgument;
     if(!open_)return kIOReturnNotReady;
+    if(request->reserved==0x54494d45u) {
+        uint32_t words[15]={};
+        memcpy(words,request->text,request->bytes<sizeof(words)?request->bytes:sizeof(words));
+        for(unsigned i=0;i<15;++i)native_adreno_optime[i]=native_adreno_optime[i]+words[i];
+        return kIOReturnSuccess;
+    }
     if(request->reserved || request->bytes>NativeAdrenoAbiMetadataBytes)return kIOReturnBadArgument;
     Entry *entry=find(request->handle);
     if(!entry || entry->unreleasable)return kIOReturnBadArgument;
