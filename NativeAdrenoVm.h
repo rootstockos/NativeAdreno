@@ -45,7 +45,9 @@ class NativeAdrenoVm final {
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
+        uint32_t owner=0;   /* the client context that mapped it (setOwner), 0 the kernel */
     };
+    uint32_t owner_=0;
     Mapping *mappings_=nullptr;
     NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
     size_t free_hint_=0;   /* no free mappings_ slot below it */
@@ -93,6 +95,11 @@ public:
     IOReturn map(NativeAdrenoMemory *,unsigned upper,uint64_t iova,
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
+    /* The client context the next map() and publishMapped() act for (NativeAdrenoUserClient's context_; 0 the kernel). With
+     * native_adreno_owner_maint set, publishMapped maintains only that client's mappings: a client's command streams can only address
+     * what it mapped, and every client imports the surfaces it draws from itself. The VM is shared by every client, so maintaining all
+     * of them on every submission cleaned every client's imports for every other client (asteroids T51: 126 GiB in 118 s). */
+    void setOwner(uint32_t owner) {owner_=owner;}
     IOReturn holdJob(uint64_t handle);
     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read

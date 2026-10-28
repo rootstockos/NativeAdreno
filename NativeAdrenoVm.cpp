@@ -32,6 +32,8 @@ extern "C" {volatile uint32_t native_adreno_import_policy=1;}
  * owned memory (cleaned and invalidated), [4] imports invalidated after a submission; [5] publishMapped calls, [6] the largest cacheable
  * owned buffer maintained (bytes), [7] cacheable owned buffers maintained. */
 extern "C" {volatile uint64_t native_adreno_maint[8];}
+/* Per-client maintenance (default 0; the board sets 1 from sheng-gpu-own-maint=1): see NativeAdrenoVm::setOwner. */
+extern "C" {volatile uint32_t native_adreno_owner_maint;}
 static bool gpuWrittenImport(const NativeAdrenoMemory *memory,unsigned permissions)
 {return native_adreno_import_policy && memory->imported() && (permissions&ArmSmmu4KWrite);}
 static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
@@ -354,6 +356,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         native_adreno_vm_kind_us[kind][1]=native_adreno_vm_kind_us[kind][1]+clock.elapsed();
         native_adreno_vm_kind_us[kind][2]=native_adreno_vm_kind_us[kind][2]+spans;
     }
+    record->owner=owner_;
     record->handle=next_handle_++;*handle=record->handle;index_.insert(record->handle,(uint32_t)(record-mappings_));
     result_.complete=true;return kIOReturnSuccess;
 }
@@ -437,9 +440,11 @@ IOReturn NativeAdrenoVm::publishMapped()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     native_adreno_maint[5]=native_adreno_maint[5]+1;
+    const bool own=native_adreno_owner_maint && owner_;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
         if(!m.memory)continue;
+        if(own && m.owner!=owner_)continue;
         if(coherentMapping(m.writeback) || importedUntouched(m.memory) || (native_adreno_import_skip && m.memory->imported()) ||
            gpuWrittenImport(m.memory,m.permissions)) {
             if(m.memory->imported())native_adreno_maint[1]=native_adreno_maint[1]+m.memory->bytes();

@@ -283,8 +283,10 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
     const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    vm_->setOwner(context_);
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
         coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
+    vm_->setOwner(0);
     if(status)return status;
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
     if(end>window_peak_)window_peak_=end;
@@ -350,8 +352,10 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     uint32_t fence=0;
     used_=true;
     ring_->useContext(context_);
+    vm_->setOwner(context_);
     const IOReturn status=submit_->submit(buffers,request->buffer_count,
         queue_base_+static_cast<uint32_t>(request->queue),&fence);
+    vm_->setOwner(0);
     if(status)return status;
     reply->fence=fence;
     return kIOReturnSuccess;
