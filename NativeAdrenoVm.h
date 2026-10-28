@@ -5,7 +5,7 @@
 #include "ArmSmmu4KStreams.h"
 #include "NativeAdrenoHandleIndex.h"
 struct NativeAdrenoVmRegion {
-    NativeAdrenoMemory *tables;
+    NativeAdrenoTablePages *tables;
     ArmSmmu4KLiveArena *arena;
     ArmSmmu4KLiveState *state;
 };
@@ -27,10 +27,6 @@ struct NativeAdrenoVmResult {
  * only the owned streams. Uncertain resources require independent real reset.
  * No VM may be advertised to apps until per-client isolation, submission
  * validation/protection, genuine IRQ fences and reset are implemented. */
-/* One table for every client's mappings: 1024 filled up once the render server primed its shaders (int-237: BoMap refused with
- * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed), and 4096 after a few app
- * switches (i567: both backboardd crashes came at objects=4096, after it held about 4000 for minutes). */
-enum : size_t {NativeAdrenoVmMaxObjects=16384};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -49,7 +45,7 @@ class NativeAdrenoVm final {
     };
     uint32_t owner_=0;
     Mapping *mappings_=nullptr;
-    NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+    NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
     size_t free_hint_=0;   /* no free mappings_ slot below it */
     size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
     size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
@@ -60,10 +56,21 @@ class NativeAdrenoVm final {
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
     ArmSmmu4KRange *ranges_=nullptr;
+    /* The kit's physical-alias sort scratch (ArmSmmu4KLiveArena::alias_scratch) for this VM's regions: one entry per range, grown with
+     * ranges_, as the smaller compared side never holds more ranges than the table. */
+    uint32_t *alias_scratch_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
+    /* Both tables grow on demand with no limit but memory (a VM per GPU process: most use a few hundred objects; a fixed table filled up
+     * at 1024, then 4096 mappings: int-237, i567). */
+    size_t mapping_capacity_=0;
+    bool growRanges(size_t needed);
+    void freeTables();
+    bool growMappings();
     unsigned budget_=0;
     uint64_t next_handle_=1;
-    bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
+    uint64_t faults_=0,hangs_=0;
+    bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
@@ -87,7 +94,7 @@ public:
     NativeAdrenoVm &operator=(const NativeAdrenoVm &)=delete;
     IOReturn attach(const ArmSmmu4KIo *,ArmSmmu4KContextConfig *,ArmSmmu4KStreamState *,
         const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
-        size_t max_spans,unsigned poll_budget);
+        size_t first_spans,unsigned poll_budget);
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();
@@ -135,6 +142,8 @@ public:
     /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
      * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
     IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The physical address of the leaf descriptor that maps the page at target (the table walk coherence proof); false when none does. */
+    bool leafPhysical(uint64_t target,uint64_t *physical) const;
     /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
     IOReturn faultState(uint32_t out[4]) const;
     /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
@@ -144,6 +153,21 @@ public:
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);
     bool poisoned() const {return poisoned_;}
+    /* A GPU hang this VM's submission caused. As Metal does after a GPU restart, only the hung command buffer is lost: the process keeps
+     * its device, its queued submissions run again and new ones are taken (msm instead makes the VM unusable, and the client then
+     * reports its device lost; when that client was the render server, backboardd ended and SpringBoard's restart stalled, untagged-1f4ba0a24).
+     * hangs() counts them; faults(), which a client turns into a lost device, stays for a VM whose table failed. */
+    void noteHang(bool) {++hangs_;}
+    uint64_t hangs() const {return hangs_;}
+    uint64_t faults() const {return faults_;}
+    bool unusable() const {return unusable_;}
+    /* A process address space: its failure poisons only itself (its tables and BOs), never the streams the kernel table shares. */
+    void keepStreamsOnFailure() {fault_streams_=false;}
+    /* The lower region's table root with this VM's ASID in bits 63:48: what the bank's TTBR0 holds while the GPU runs this VM. */
+    uint64_t ttbr0() const {return regions_[0].state && context_?regions_[0].state->tables.root_physical|(uint64_t)context_->asid<<48:0;}
+    unsigned asid() const {return context_?context_->asid:0;}
+    /* TLBIASID of this VM's ASID (its translations only), for an ASID about to be given to another table. */
+    IOReturn invalidateAsid();
     size_t objectCount() const {return objects_;}
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}

@@ -41,19 +41,20 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     }
     if(!status) {
         /* Prefer the board's reserved GMU pool (withRange over existing physical pages, the upstream
-         * sheng hand-off) and only fall back to the VM when the board publishes no pool. */
+         * sheng hand-off) and only fall back to the VM when the board publishes no pool. Table pages come on demand (2df9f1c). */
 #if defined(SHENG_GMU_POOL_BASE) && defined(SHENG_GMU_POOL_BYTES)
         status=gmu_.adopt(SHENG_GMU_POOL_BASE,SHENG_GMU_POOL_BYTES,
-            NativeAdrenoGmuDefaultSizes(TablePages*0x1000),report->output_bits);
+            NativeAdrenoGmuDefaultSizes(),report->output_bits);
 #else
         status=kIOReturnNotFound;
 #endif
-        if(status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(TablePages*0x1000),report->output_bits);
+        if(status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(),report->output_bits);
     }
     if(!status) {
         step(Prepare);
-        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
-            bank,asid,1000,report->output_bits);
+        /* The GMU's own space is 0..2 GiB (a6xx_gmu_memory_probe: msm_gem_vm_create(drm, mmu, "gmu", 0x0, 0x80000000, true)), a 32-bit input. */
+        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,GmuApertureBytes/4096,
+            bank,asid,1000,report->output_bits,32);
     }
     if(!status) {
         step(Program);

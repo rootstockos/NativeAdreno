@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
  * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
- * connection that mounts its own NativeAdrenoUserClient core. Up to NativeAdrenoMaxClients connections (one per Metal process) share
- * the VM, the submit object and the ring: each core has its own handles, its own queue range on the ring and its own window of the
- * one GPU address space (the render server the large one), and closing a connection waits for its own jobs only, then unmaps and
- * frees everything it created. Not yet done: per-process GPU page tables (the windows are enforced by the driver, not by the SMMU)
- * and a reset path. This is not the Metal or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
+ * connection that mounts its own NativeAdrenoUserClient core. Every connection of a user process gets its own GPU address space
+ * (NativeAdrenoProcessVm: its own page table and ASID, switched into the GPU's context bank for its submissions) and its own queue
+ * range on the one ring; there is no fixed number of connections. Closing a connection waits for its own jobs, unmaps and frees
+ * everything it created and frees its address space. The board's kernel connection uses the kernel table. A GPU hang is found by msm's
+ * hangcheck and restarted through the board's hook; only the client whose submission hung sees its device lost. This is not the Metal
+ * or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
  * BO CPU mappings are handed out as uncached physical-range mappings to match the GPU's non-cacheable PTEs.
  * The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the processes that use Metal
  * allow IOServiceOpen for that user-client class name, and nothing else in this system can create one (the Apple AGX kext is
@@ -15,13 +16,16 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <pexpert/pexpert.h>
 #include <IOKit/IOUserClient.h>
 #include <string.h>
 #include <kern/thread.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoDiag.h"
+#include "NativeAdrenoGpuContext.h"
 
 extern "C" void proc_selfname(char *, int);
+extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
 extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
 
@@ -78,24 +82,37 @@ extern "C" volatile uint32_t native_adreno_trace_stage;
 extern "C" {
 struct NativeAdrenoOpenRecord native_adreno_open_log[8];
 volatile uint32_t native_adreno_open_log_count;
+/* One row per process name that opened the plugin type (first eight names): opens granted, refused (sandbox, or no address space),
+ * closes, the board log row of its live connection (4 the shared row, 0xff none), the highest GPU address its mappings reached (MiB) and its
+ * last refusal (NativeAdrenoClientRecord in NativeAdrenoDiag.h). */
 struct NativeAdrenoClientRecord native_adreno_client_log[8];
-struct NativeAdrenoClientText native_adreno_client_text[4];
-/* Why the latest mount of a connection failed: [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] its IOReturn; [2] the slot; [3] failures so far. */
+/* The last text line (the plugin's failure reason) each process other than the render server streamed: process name and a 64-byte line. */
+struct NativeAdrenoClientText native_adreno_client_text[8];
+/* Why the latest mount of a connection failed: [0] 1 no address space, 2 the core's open, 3 the window scope; [1] its IOReturn; [2] the queue base; [3] failures so far. */
 volatile uint32_t native_adreno_mount_fail[4];
 /* Processes that read MetalPluginName (the Metal discovery), first twelve names, with counts. */
 struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
 struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
 }
-/* GPU address windows inside the board's VA range (GpuPowerProbe gDeviceInfo: 0x20000000..0x80000000 of the 2 GiB aperture). Slot 0 is the
- * render server's (it held the whole 1.5 GiB alone before int-155 and used at most a few hundred MiB); slots 1 and 2 are for other Metal
- * processes. A kernel connection (the board's self-test) maps where it likes and is never scoped. */
-/* Slot 0 is the render server's 1 GiB (it reached 934 MiB in int-196); the rest of the aperture is shared by three more processes (PosterBoard for the
- * wallpaper, iconservicesagent for the icons, WidgetRenderer_Default for the widgets: int-196's screen pictures showed a black wallpaper and white widget
- * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
- * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
-enum : unsigned {NativeAdrenoMaxClients=4};
-static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
-    {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
+/* Every user connection's GPU addresses: its own address space from GpuClientVaStart (msm ADRENO_VM_START) to the aperture's end, above
+ * the kernel buffers' fixed addresses and the GMEM window that each address space also maps, as msm's per-process VM
+ * (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). A kernel connection (the board's self-test) maps where it likes. */
+static uint64_t clientWindowBytes(uint32_t input_bits)
+{return input_bits>32 && input_bits<=48?(UINT64_C(1)<<input_bits)-GpuClientVaStart:0;}
+/* The board's qcom_scm_set_gpu_smmu_aperture result ([0] availability, [1] the call's x0: 0 is success); [2] the CP switch check's
+ * status, [3] the table mode in use. */
+extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
+/* The CP switch check: the bank's image (NativeAdrenoGpuContext::observeContext) before the switch [0..7] and after it [8..15], and the
+ * kit status of each [16], [17]; a fault the switch left latched: FAR lo, hi, FSYNR0 [18..20] and the status after clearing it [21]. */
+volatile uint32_t native_adreno_cp_image[22];}
+/* Table switching (NativeAdrenoSubmit): 2 the CP switches in the ring (the default once the board opened the CP's SMMU aperture), 1 the
+ * CPU writes TTBR0 with the GPU idle. sheng-gpu-ttbr=1 or 2 forces one. */
+static unsigned tableMode()
+{
+    unsigned mode=native_adreno_cp_aperture[0] && !(native_adreno_cp_aperture[0]>>31) && !native_adreno_cp_aperture[1]?2:1;
+    PE_parse_boot_argn("sheng-gpu-ttbr",&mode,sizeof mode);
+    return mode==2?2:1;
+}
 
 namespace {
 void shiftName(char names[3][17]) {
@@ -113,11 +130,62 @@ struct Published {
     const NativeAdrenoAbiDeviceInfo *info=nullptr;
     IOLock *lock=nullptr;
     IOService *service=nullptr;
-    bool slots[NativeAdrenoMaxClients]{};
+    NativeAdrenoGpuContext *context=nullptr;
+    bool rows[4]{};   /* the board log's client rows (NativeAdrenoUserClient::setStatsSlot): 0 the render server, 1..3 the next processes */
+    uint32_t next_client=1;   /* queue range n (NativeAdrenoQueueRange) per user connection; range 0 is the kernel connection's */
     bool kernel_client=false;
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
+    /* Global fault and restart counts every connection reports (NativeAdrenoUserClient::status adds its own VM's faults). */
+    NativeAdrenoStatus status;
+    NativeAdrenoRestart restart=nullptr;
+    void *restart_cookie=nullptr;
 } g;
+}
+/* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
+ * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
+extern "C" {volatile uint32_t native_adreno_recovery[8];}
+/* SMMU context faults ended before a restart (NativeAdrenoGpuContext::endFault): [0] how many, then the last one's FSR, FAR lo, FAR hi,
+ * FSYNR0. A latched FSR fails every later table operation's proof of the bank, so a restart that left it would poison the tables. */
+extern "C" {volatile uint32_t native_adreno_recovery_fault[5];}
+/* The board's GPU restart (a6xx_recover's reset and hw_init), installed before or after publication. */
+extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cookie)
+{
+    if(g.lock)IOLockLock(g.lock);
+    g.restart=restart;g.restart_cookie=cookie;
+    if(g.lock)IOLockUnlock(g.lock);
+}
+/* msm's hangcheck timer: every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms, msm_gpu.h) the ring is checked for progress; a hang restarts the
+ * GPU through the board's hook and replays the other submissions (recover_worker). Without a hook a hang is only counted. */
+static void nativeAdrenoHangcheck(void *,wait_result_t)
+{
+    for(;;) {
+        IOSleep(500);
+        IOLockLock(g.lock);
+        bool hung=false;
+        if(g.submit && !g.submit->hangCheck(&hung) && hung) {
+            native_adreno_recovery[0]=native_adreno_recovery[0]+1;
+            if(g.restart) {
+                uint32_t fault[4]={};
+                if(g.context && !g.context->endFault(fault) && fault[0]) {
+                    native_adreno_recovery_fault[0]=native_adreno_recovery_fault[0]+1;
+                    for(unsigned i=0;i<4;++i)native_adreno_recovery_fault[1+i]=fault[i];
+                }
+                NativeAdrenoRecovery result{};
+                const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
+                native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
+                if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
+                if(result.guilty==g.vm)native_adreno_recovery[7]=native_adreno_recovery[7]+1;
+                if(status)native_adreno_recovery[2]=native_adreno_recovery[2]+1;
+                else native_adreno_recovery[1]=native_adreno_recovery[1]+1;
+                /* Only a GPU that did not come back is everyone's loss; after a restart every client goes on, as Metal's do. */
+                if(status)g.status.noteFault();
+                if(!status)g.status.noteSuspend();
+            }
+        }
+        IOLockUnlock(g.lock);
+    }
 }
 
 class NativeAdrenoGpuPublished : public IOService {
@@ -134,20 +202,22 @@ class AGXDeviceUserClient : public IOUserClient {
     bool handoffOnly_=false;
     bool kernel_=false;
     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
-    unsigned slot_=NativeAdrenoMaxClients;
+    NativeAdrenoProcessVm *space_=nullptr;   /* a user connection's own address space */
+    unsigned row_=4;
     char name_[20]{};
     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
      * the descriptor again and unmaps only a mapping that belongs to THAT descriptor (kIOMapReference); a fresh descriptor per call made the
      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
      * pmap_assert_free panicked the freeing core and the panic screen parked it (the "BoFree hang", dead touch). */
     struct View {uint32_t token;IOMemoryDescriptor *descriptor;};
-    /* One view per live BO token. The cache must hold every BO the client can have (NativeAdrenoClientMaxObjects): a BO whose view is not
-     * cached makes IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
+    /* One view per live BO token. The cache holds every BO the client has (it grows with the tokens): a BO whose view is not cached makes
+     * IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
-    enum {MaxViews=NativeAdrenoClientMaxObjects};
     /* A token is its BO's entry index plus one, so it names its own slot (a walk over every slot ran on each CPU map and unmap). */
-    View *viewSlot(uint32_t token) {return views_ && token && token<=MaxViews?&views_[token-1]:nullptr;}
-    View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
+    View *viewSlot(uint32_t token) {return views_ && token && token<=view_capacity_?&views_[token-1]:nullptr;}
+    View *views_=nullptr;   /* on the heap, grown to the highest token (growViews) */
+    size_t view_capacity_=0;
+    bool growViews(uint32_t token);
     void dropViews(uint32_t token);
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
@@ -211,32 +281,47 @@ bool AGXDeviceUserClient::mount(bool kernel)
     if(!core)return false;
     IOLockLock(g.lock);
     bool ok=false;
-    /* The render server takes slot 0 (the large window) when free; every other process, or a second render-server connection, the next free one. */
-    unsigned slot=NativeAdrenoMaxClients;
-    if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
-    else {
-        if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
-        for(unsigned i=1;slot==NativeAdrenoMaxClients && i<NativeAdrenoMaxClients;++i)if(!g.slots[i])slot=i;
-    }
-    const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
-    if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
+    const bool server=!kernel && !strncmp(name_,"backboardd",sizeof name_);
+    NativeAdrenoProcessVm *space=nullptr;
+    IOReturn opened=kIOReturnSuccess;
+    if(kernel)opened=g.kernel_client?kIOReturnBusy:kIOReturnSuccess;
+    else opened=g.context?g.context->createVm(&space):kIOReturnNotReady;
+    NativeAdrenoVm *vm=kernel?g.vm:space?space->vm():nullptr;
+    if(!opened && !vm)opened=kIOReturnNotReady;
+    if(!opened)opened=core->open(NativeAdrenoAbiVersion,vm,g.submit,g.ring,g.input_bits,g.output_bits);
+    if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=space?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=0;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
     if(opened==kIOReturnSuccess) {
         if(g.timer)core->attachTimer(g.timer);
         if(g.info)core->attachDeviceInfo(g.info);
-        /* Queue ranges: the kernel client keeps range 0 alone (no user slot is live while the board's self-test runs); users get their slot's. */
-        const IOReturn scoped=kernel?core->setScope(0,0,0):core->setScope(slot*NativeAdrenoAbiMaxQueues,kClientWindows[slot].start,kClientWindows[slot].bytes);
+        core->attachStatus(&g.status);
+        /* Queue ranges: the kernel connection keeps range 0; each user connection a range of its own, never reused while the system runs. */
+        uint64_t base=0;
+        IOReturn scoped=kIOReturnSuccess;
+        if(!kernel) {
+            base=(uint64_t)g.next_client*NativeAdrenoQueueRange;
+            const uint64_t window=clientWindowBytes(g.input_bits);
+            scoped=!g.next_client || !window?kIOReturnNoResources:core->setScope(base,GpuClientVaStart,window);
+        } else scoped=core->setScope(0,0,0);
         if(scoped==kIOReturnSuccess) {
-            core_=core;core=nullptr;slot_=slot;kernel_=kernel;live_=true;ok=true;
-            if(kernel)g.kernel_client=true;else g.slots[slot]=true;
+            if(!kernel)++g.next_client;
+            unsigned row=4;
+            if(server && !g.rows[0])row=0;
+            for(unsigned i=1;!server && row==4 && i<4;++i)if(!g.rows[i])row=i;
+            if(row<4)g.rows[row]=true;
+            core->setStatsSlot(row);
+            core_=core;core=nullptr;space_=space;space=nullptr;row_=row;kernel_=kernel;live_=true;ok=true;
+            if(kernel)g.kernel_client=true;
             ++g.opened;
-            if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=slot;
+            if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=row;
         } else {
-            native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
+            native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=uint32_t(base>>32);native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
             core->releaseAll(&g.clock,0);
         }
     }
+    /* Not used by any core (a failed open or scope): nothing of it reached the GPU. */
+    if(space && g.context->destroyVm(space)) {}
     /* The mailbox page and its poller serve the render server's connection only. */
-    if(ok && !kernel && slot==0 && !strncmp(name_,"backboardd",sizeof name_)) {
+    if(ok && server && row_==0) {
         if(!gMailbox) {
             gMailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,4096,4096);
             if(gMailbox) {gMailboxWords=static_cast<volatile uint32_t *>(gMailbox->getBytesNoCopy());memset(const_cast<uint32_t *>(gMailboxWords),0,4096);}
@@ -264,13 +349,27 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
         IOMemoryDescriptor *view=nullptr;
         IOLockLock(g.lock);
         if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;v->descriptor=nullptr;v->token=0;}}
-        else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+        else if(views_)for(size_t i=0;i<view_capacity_;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
         IOLockUnlock(g.lock);
         if(!view)return;
         /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
         while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
         view->release();
     }
+}
+/* Room for token's view slot (tokens are entry indices plus one, so they stay below the client's object count). */
+bool AGXDeviceUserClient::growViews(uint32_t token)
+{
+    if(!token)return true;
+    if(token<=view_capacity_)return true;
+    size_t size=view_capacity_?view_capacity_:64;
+    while(size<token)size*=2;
+    View *made=IONewZero(View,size);
+    if(!made)return false;
+    for(size_t i=0;i<view_capacity_;++i)made[i]=views_[i];
+    if(views_)IODelete(views_,View,view_capacity_);
+    views_=made;view_capacity_=size;
+    return true;
 }
 IOReturn AGXDeviceUserClient::clientClose()
 {
@@ -282,10 +381,15 @@ IOReturn AGXDeviceUserClient::clientClose()
     if(live_) {
         const uint64_t peak=core_->windowPeak();
         status=core_->releaseAll(&g.clock,2000000);
-        /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
+        /* The address space goes once the GPU no longer runs it: idle, and the kernel table back in the bank if it was installed. */
+        if(!status && space_)status=g.submit->forgetVm(space_->vm(),&g.clock,2000000);
+        if(!status && space_) {status=g.context->destroyVm(space_);if(!status)space_=nullptr;}
+        /* A failed teardown leaves the objects (and the address space) live: nothing is forced or reused. */
         if(!status) {
             live_=false;
-            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients)g.slots[slot_]=false;
+            if(kernel_)g.kernel_client=false;
+            if(row_<4)g.rows[row_]=false;
+            row_=4;
             ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
             if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
                 record->closes=record->closes+1;record->slot=0xff;
@@ -301,7 +405,7 @@ IOReturn AGXDeviceUserClient::clientClose()
 void AGXDeviceUserClient::free()
 {
     dropViews(0);
-    if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
+    if(views_) {IODelete(views_,View,view_capacity_);views_=nullptr;view_capacity_=0;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
     if(core_ && !live_) {delete core_;core_=nullptr;}
     IOUserClient::free();
@@ -333,8 +437,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
     IOLockLock(g.lock);
-    if(!views_)views_=IONewZero(View,MaxViews);
-    if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+    if(!growViews(type)) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
@@ -668,16 +771,16 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
         connection->setProperty("NativeSandboxGrant",kOSBooleanTrue);
         native_adreno_metal_diag.grants=native_adreno_metal_diag.grants+1;
     }
-    /* limit caps the connections granted to each process name, so one process that crashes on every launch cannot loop forever, and cannot use
-     * up the others' opens; a process other than the render server gets at most eight per boot. */
-    const unsigned cap=strncmp(opener,"backboardd",sizeof opener)?(limit && limit<8?limit:8):limit;
+    /* limit (boot-arg sheng-gpu-metal-opens, default 0 = none) caps the connections granted to each process name. No cap by default: a
+     * client that crashed and restarts (iconservicesagent, i-39b429634) must get the GPU again, or it is left without one for the boot. */
+    const unsigned cap=limit;
     IOLockLock(g.lock);
     NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
     const bool capped=cap && record && record->opens>=cap;
     IOLockUnlock(g.lock);
     IOReturn refusal=kIOReturnSuccess;
     if(capped)refusal=kIOReturnBusy;
-    else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* every slot taken */
+    else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* no address space or queue range */
     if(refusal) {
         connection->release();
         native_adreno_metal_diag.busy=native_adreno_metal_diag.busy+1;
@@ -715,6 +818,41 @@ IOReturn NativeAdrenoGpuPublished::newUserClient(task_t owningTask,void *securit
     return native_adreno_new_user_client(this,owningTask,securityID,type,properties,handler,0);
 }
 
+static IOReturn checkCpSwitch()
+{
+    uint32_t kit=0,image[8]={};
+    (void)g.context->observeContext(&kit,image);
+    native_adreno_cp_image[16]=kit;for(unsigned i=0;i<8;++i)native_adreno_cp_image[i]=image[i];
+    NativeAdrenoProcessVm *space=nullptr;
+    IOReturn status=g.context->createVm(&space);
+    if(status)return status;
+    NativeAdrenoSubmitBuffer ib{};
+    status=g.context->probeBuffer(space,&ib.handle,&ib.iova,&ib.bytes);
+    uint32_t fence=0;
+    if(!status)status=g.submit->submit(space->vm(),&ib,1,0,&fence,&g.clock);
+    if(!status)status=g.submit->waitAll(&g.clock,2000000);
+    uint64_t seen=0;
+    if(!status)status=g.context->readTtbr0(&seen);
+    if(!status && seen!=space->vm()->ttbr0())status=kIOReturnUnsupported;
+    IOReturn freed=g.submit->forgetVm(space->vm(),&g.clock,2000000);
+    if(!freed)freed=g.context->destroyVm(space);
+    /* Every table operation proves the bank's image (TTBR0 aside): a CP switch that changed another register would fail the next one
+     * and poison the kernel table. */
+    const IOReturn observed=g.context->observeContext(&kit,image);
+    native_adreno_cp_image[17]=kit;for(unsigned i=0;i<8;++i)native_adreno_cp_image[8+i]=image[i];
+    if(observed && kit==uint32_t(ArmSmmu4KFault)) {
+        uint32_t far[3]={};
+        if(!g.context->clearFault(image[7],far)) {
+            native_adreno_cp_image[18]=far[0];native_adreno_cp_image[19]=far[1];native_adreno_cp_image[20]=far[2];
+            const IOReturn again=g.context->observeContext(&kit,image);
+            native_adreno_cp_image[21]=kit|0x100;
+            /* The GPU touched an address the probe's table does not map: the switch itself worked. */
+            if(!again && !status && !freed)return kIOReturnSuccess;
+        }
+    }
+    if(!status && !freed && observed)status=kIOReturnNotPermitted;
+    return status?status:freed;
+}
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
@@ -729,7 +867,27 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         return kIOReturnNoMemory;
     }
     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+    /* Per-process address spaces: without table switching every user connection would be refused (createVm needs it). */
+    g.context=NativeAdrenoGpuContextObject();
+    IOReturn switching=g.context?g.context->enableSwitching():kIOReturnNotReady;
+    if(!switching)switching=submit->setTableSwitching(tableMode(),
+        [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
+    native_adreno_table_switches[6]=uint32_t(switching);
+    if(switching)g.context=nullptr;
+    else if(submit->tableMode()==2) {
+        /* The CP's switch must reach the bank: one NOP submission on a fresh address space, then the bank's TTBR0 is read back. A
+         * switch that did not land falls back to the CPU's. */
+        const IOReturn checked=checkCpSwitch();
+        native_adreno_cp_aperture[2]=uint32_t(checked);
+        if(checked && !submit->outstanding())(void)submit->setTableSwitching(1,
+            [](void *cookie,uint64_t ttbr0)->IOReturn {return static_cast<NativeAdrenoGpuContext *>(cookie)->writeTtbr0(ttbr0);},g.context);
+    }
+    native_adreno_cp_aperture[3]=submit->tableMode();
     g.service=service;g.published=true;
+    {
+        thread_t thread=nullptr;
+        if(kernel_thread_start(nativeAdrenoHangcheck,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+    }
     service->setName("NativeAdrenoGpu");
     service->registerService();
     return kIOReturnSuccess;

@@ -3,6 +3,7 @@
  * submit object and user-client core over the authored memory doubles, with a software "CP" that retires every submission at
  * once. It runs no shader and touches no hardware; it exists so the Turnip darwin backend can be driven through a real
  * Vulkan instance before the userspace side ever runs on the tablet. Narrow C interface for the IOKit shim translation unit. */
+#include <unistd.h>
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoUserClient.h"
@@ -111,6 +112,8 @@ IOReturn translate(IOReturn status) {return status;}
 }
 
 extern "C" {
+/* The kernel KPI the user client names an import's task by; the host stand-in is this process. */
+int proc_selfpid(void) {return getpid();}
 /* Return codes are the fixture's IOReturn values; the shim translates them. */
 int host_gpu_open() {
     std::lock_guard<std::recursive_mutex> guard(serviceLock);
@@ -179,6 +182,10 @@ void host_gpu_inject_failure(uint32_t method,int status,uint32_t count) {
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,size_t count,bool){return spans && count?kIOReturnSuccess:kIOReturnBadArgument;}
+/* Host doubles: maintenance accounting, page attributes and the pmap's user mappings have no host equivalent. */
+void NativeAdrenoNotePhase(unsigned,size_t) {}
+bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t) {return false;}
+extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *) {return 0;}
 IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans,size_t count,uint32_t *reset)
 {return spans && count && reset?kIOReturnSuccess:kIOReturnBadArgument;}
 IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation op)

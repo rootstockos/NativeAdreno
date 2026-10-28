@@ -6,7 +6,7 @@
 /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
-enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,
     SubmitMaxBuffers=(uint32_t)NativeAdrenoSubmitMaxBuffers,SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
@@ -57,6 +57,7 @@ extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 extern "C" {volatile uint32_t native_adreno_unstick[15];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
+extern "C" volatile uint32_t native_adreno_table_switches[8];
 IOReturn NativeAdrenoSubmit::poison()
 {
     poisoned_=true;return kIOReturnIOError;
@@ -69,24 +70,69 @@ NativeAdrenoSubmit::Job *NativeAdrenoSubmit::find(uint32_t fence)
 NativeAdrenoSubmit::Job *NativeAdrenoSubmit::free()
 {
     for(auto &job:jobs_)if(!job.active)return &job;
-    return nullptr;
+    Job **items=IONewData(Job *,jobs_.count+1);
+    Job *job=items?new Job:nullptr;
+    if(!job) {if(items)IODeleteData(items,Job *,jobs_.count+1);return nullptr;}
+    for(size_t i=0;i<jobs_.count;++i)items[i]=jobs_.items[i];
+    items[jobs_.count]=job;
+    if(jobs_.items)IODeleteData(jobs_.items,Job *,jobs_.count);
+    jobs_.items=items;++jobs_.count;
+    return job;
 }
 IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
 {
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
-    vm_=vm;ring_=ring;attached_=true;stats_={};
+    vm_=vm;ring_=ring;attached_=true;stats_={};table_vm_=vm;
     return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(mode>2 || (mode && !write) || outstanding())return kIOReturnBadArgument;
+    table_mode_=mode;write_table_=write;table_cookie_=cookie;table_vm_=vm_;
+    if(mode==2)ring_->tableInstalled(vm_->ttbr0());
+    return kIOReturnSuccess;
+}
+/* Makes vm the table the GPU runs for the next submission. Mode 1: once every earlier job has finished, the CPU writes TTBR0 (the bank
+ * caches translations per ASID, so the switch needs no TLB operation). Mode 2: the ring's next prologue carries the switch, which the CP
+ * runs after every earlier submission. */
+IOReturn NativeAdrenoSubmit::useVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock)
+{
+    if(!table_mode_ || vm==table_vm_)return kIOReturnSuccess;
+    if(table_mode_==2) {ring_->useTable(vm->ttbr0());table_vm_=vm;return kIOReturnSuccess;}
+    if(!clock)return kIOReturnBadArgument;
+    IOReturn status=waitAll(clock,2000000);
+    if(status)return status;
+    status=write_table_(table_cookie_,vm->ttbr0());
+    if(status)return poison();
+    native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
+    table_vm_=vm;return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::forgetVm(NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!vm || vm==vm_)return kIOReturnBadArgument;
+    IOReturn status=waitAll(clock,timeout_us);
+    if(status)return status;
+    if(table_vm_!=vm && !(table_mode_==2 && ring_->table()==vm->ttbr0()))return kIOReturnSuccess;
+    /* The GPU is idle and every queued switch has run: the CPU puts the default table back. */
+    status=write_table_?write_table_(table_cookie_,vm_->ttbr0()):kIOReturnNotReady;
+    if(status)return poison();
+    native_adreno_table_switches[1]=native_adreno_table_switches[1]+1;
+    if(table_mode_==2)ring_->tableInstalled(vm_->ttbr0());
+    table_vm_=vm_;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::release(Job &job)
 {
     IOReturn status=kIOReturnSuccess;
+    NativeAdrenoVm *vm=job.vm?job.vm:vm_;
     for(size_t i=0;i<job.count;++i) {
-        IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
+        IOReturn retired=vm->retireJobAfterCompletion(job.handles[i]);
         if(retired)status=retired;else ++stats_.references_retired;
     }
     if(status)return poison();
-    if(vm_->acquireImported())return poison();
+    if(vm->acquireImported())return poison();
     job={};return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::detach()
@@ -95,11 +141,11 @@ IOReturn NativeAdrenoSubmit::detach()
     if(!attached_)return kIOReturnNotReady;
     attached_=false;vm_=nullptr;ring_=nullptr;return kIOReturnSuccess;
 }
-bool NativeAdrenoSubmit::queueOutstanding(uint32_t queue) const
+bool NativeAdrenoSubmit::queueOutstanding(uint64_t queue) const
 {
     return rangeOutstanding(queue,1);
 }
-bool NativeAdrenoSubmit::rangeOutstanding(uint32_t first,uint32_t count) const
+bool NativeAdrenoSubmit::rangeOutstanding(uint64_t first,uint64_t count) const
 {
     for(const auto &job:jobs_)if(job.active && job.queue-first<count)return true;
     return false;
@@ -109,10 +155,19 @@ size_t NativeAdrenoSubmit::outstanding() const
     size_t count=0;for(const auto &job:jobs_)if(job.active)++count;return count;
 }
 IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
-    uint32_t queue,uint32_t *fence)
+    uint64_t queue,uint32_t *fence)
+{
+    return submit(nullptr,buffers,count,queue,fence,nullptr);
+}
+IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitBuffer *buffers,size_t count,
+    uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
+    if(!vm)vm=vm_;
+    NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    /* msm_ioctl_gem_submit refuses a VM a hang made unusable. */
+    if(vm->unusable())return kIOReturnNotPermitted;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
     native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
     if(count>native_adreno_submit_ibs[2])native_adreno_submit_ibs[2]=(uint32_t)count;
@@ -144,7 +199,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     IOReturn swept=retireCompleted();
     if(swept)return swept;
     Job *job=free();
-    if(!job)return kIOReturnBusy;
+    if(!job)return kIOReturnNoMemory;
     for(size_t i=0;i<handle_count;++i) {
         IOReturn status=vm_->holdJob(handles[i]);
         if(status) {
@@ -224,6 +279,11 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
     }
+    status=useVm(vm,clock);
+    if(status) {
+        for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
+        return status;
+    }
     status=ring_->submitFramed(words,word_count,&value);
     if(status) {
         /* A poisoned ring may already have consumed the WPTR write, so the
@@ -231,14 +291,17 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         if(ring_->poisoned()) {
             *job=Job{};++stats_.poisoned_jobs;
             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
-            job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
+            job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
             return poison();
         }
         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
-        return status;
+        /* No room in the ring yet: the caller waits for an earlier job and submits again. */
+        return status==kIOReturnNoResources?kIOReturnBusy:status;
     }
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
-    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
+    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
+    job->context=ring_->context();job->word_count=word_count;
+    for(size_t i=0;i<word_count;++i)job->words[i]=words[i];
     ++stats_.submissions;
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
     *fence=value;
@@ -314,20 +377,22 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     (void)vm_->faultState(fault);
     for(uint32_t i=0;i<4;++i)native_adreno_stall_mem[i]=fault[i];
     uint64_t ib=0;uint32_t size=0;
-    if(!ring_->ibBefore(words[8],&ib,&size))peekIb(vm_,ib,size,words[12],&native_adreno_stall_mem[4]);
-    else peekFetch(vm_,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
-    if(!ring_->ibBefore(words[16],&ib,&size))peekIb(vm_,ib,size,words[18],&native_adreno_stall_mem[4+17]);
-    else peekFetch(vm_,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
-    peekFetch(vm_,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
+    /* The IBs are the stalled job's: read them through its address space (the kernel's maps none of a client's BOs). */
+    const Job *job=find(next);
+    const NativeAdrenoVm *space=job && job->vm?job->vm:vm_;
+    if(!ring_->ibBefore(words[8],&ib,&size))peekIb(space,ib,size,words[12],&native_adreno_stall_mem[4]);
+    else peekFetch(space,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
+    if(!ring_->ibBefore(words[16],&ib,&size))peekIb(space,ib,size,words[18],&native_adreno_stall_mem[4+17]);
+    else peekFetch(space,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
+    peekFetch(space,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
     {
-        const Job *job=find(next);
         uint64_t brIb=(uint64_t)words[11]<<32|words[10],bvIb=(uint64_t)words[11]<<32|words[17];
         if(!ring_->ibBefore(words[8],&ib,&size))brIb=ib;
         if(!ring_->ibBefore(words[16],&ib,&size))bvIb=ib;
         native_adreno_stall_mem[55]=job?(uint32_t)job->vm_next:0;
-        native_adreno_stall_mem[56]=(uint32_t)vm_->handleAt(brIb);
-        native_adreno_stall_mem[57]=(uint32_t)vm_->handleAt(bvIb);
-        native_adreno_stall_mem[58]=(uint32_t)vm_->handleAt((uint64_t)words[21]<<32|words[20]);
+        native_adreno_stall_mem[56]=(uint32_t)space->handleAt(brIb);
+        native_adreno_stall_mem[57]=(uint32_t)space->handleAt(bvIb);
+        native_adreno_stall_mem[58]=(uint32_t)space->handleAt((uint64_t)words[21]<<32|words[20]);
     }
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;
@@ -380,7 +445,7 @@ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t
     }
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+IOReturn NativeAdrenoSubmit::waitRange(uint64_t first,uint64_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     while(rangeOutstanding(first,count)) {
@@ -403,5 +468,79 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         if(status)return status;
         ++stats_.completed;
     }
+    return kIOReturnSuccess;
+}
+bool NativeAdrenoSubmit::madeProgress()
+{
+    if(progress_retries_>=3)return false;
+    uint32_t state[6]={};
+    if(ring_->progressState(state))return false;
+    bool progress=false;
+    for(unsigned i=0;i<6;++i)if(state[i]!=last_cp_[i])progress=true;
+    for(unsigned i=0;i<6;++i)last_cp_[i]=state[i];
+    if(!progress)return false;
+    ++progress_retries_;
+    return true;
+}
+IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
+{
+    if(!hung)return kIOReturnBadArgument;*hung=false;
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    const uint32_t last=ring_->lastSubmitted();
+    if(!last)return kIOReturnSuccess;
+    uint32_t fence=0;
+    if(ring_->observeFence(last,nullptr,0,&fence)==NativeAdrenoRingFencePoisoned)return poison();
+    if(fence!=hang_fence_) {hang_fence_=fence;progress_retries_=0;return kIOReturnSuccess;}
+    if(fence>=last || madeProgress())return kIOReturnSuccess;
+    progress_retries_=0;++stats_.hangs;*hung=true;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *clock,
+    NativeAdrenoRecovery *out)
+{
+    if(!out)return kIOReturnBadArgument;*out={};
+    if(!attached_)return kIOReturnNotReady;
+    if(!restart)return kIOReturnUnsupported;
+    const uint32_t last=ring_->lastSubmitted();
+    uint32_t fence=0;
+    if(ring_->fenceValue(&fence) || fence>last)return poison();
+    /* What already completed retires as usual. */
+    for(auto &job:jobs_)if(job.active && job.fence<=fence) {
+        IOReturn status=release(job);if(status)return status;
+        ++stats_.completed;
+    }
+    const uint32_t hung=fence<last?fence+1:fence;
+    Job *guilty=fence<last?find(hung):nullptr;
+    out->fence=hung;
+    if(guilty) {
+        NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
+        vm->noteHang(vm!=vm_);out->guilty=vm;
+    }
+    IOReturn status=restart(cookie,ring_,hung);
+    out->status=status;
+    if(status)return poison();
+    poisoned_=false;hang_fence_=hung;progress_retries_=0;
+    if(guilty) {status=release(*guilty);if(status)return status;}
+    /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
+    if(table_mode_) {
+        if(!write_table_ || write_table_(table_cookie_,vm_->ttbr0()))return poison();
+        if(table_mode_==2)ring_->tableInstalled(vm_->ttbr0());
+        table_vm_=vm_;
+    }
+    uint32_t nop=0;
+    if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return poison();   /* CP_NOP */
+    for(uint32_t next=hung+1;next && next<=last;++next) {
+        Job *job=find(next);
+        NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
+        const bool run=job && !vm->unusable() && job->word_count;
+        status=useVm(vm,clock);
+        if(status)return poison();
+        ring_->useContext(job?job->context:0);
+        uint32_t value=0;
+        status=ring_->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
+        if(status || value!=next)return poison();
+        ++out->replayed;
+    }
+    ++stats_.restarts;
     return kIOReturnSuccess;
 }

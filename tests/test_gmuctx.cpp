@@ -57,8 +57,8 @@ int main()
         CHECK(report.smr==((1u<<31)|5));
         CHECK(report.cbar==mmio[(0x1000+4)/4]);
         CHECK(report.sctlr==mmio[cb/4] && (report.sctlr&1));
-        /* TTBR0 holds the table pool and ASID 1; TTBR1 is unused. */
-        CHECK(report.ttbr0==((uint64_t(1)<<48)|context.allocator().tables().spans()[0].physical));
+        /* TTBR0 holds the root table page and ASID 1; TTBR1 is unused. */
+        CHECK(report.ttbr0==((uint64_t(1)<<48)|context.allocator().tables().pagePhysical(0)));
         uint64_t ttbr1;std::memcpy(&ttbr1,mmio+(cb+0x28)/4,8);
         CHECK((ttbr1&0x0000fffffffff000)==0);
         CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnBusy);   /* one attempt per object */
@@ -99,7 +99,8 @@ int main()
         NativeAdrenoGmuContextReport report;
         CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.output_bits==36);
         CHECK((mmio[(cb+0x10)/4]&7)==1);
-        CHECK(context.allocator().tables().spans()[0].physical+0x1000*NativeAdrenoGmuContext::TablePages<=(UINT64_C(1)<<36));
+        for(size_t i=0;i<context.allocator().tables().pageCount();++i)
+            CHECK(context.allocator().tables().pagePhysical(i)+0x1000<=(UINT64_C(1)<<36));
     }
     /* An OAS code the kit cannot encode is refused before any allocation or write. */
     {
@@ -169,18 +170,20 @@ int main()
         NativeAdrenoGmuContextReport report;
         CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.step==NativeAdrenoGmuContext::Ready);
         CHECK(report.output_bits==36 && report.spans==5 && report.smr==((1u<<31)|5) && (report.s2cr&0xff)==1);
-        CHECK(fixture.created==created && fixture.device_ranges==ranges+6 && fixture.last_map_options==(kIOMapAnywhere|kIOMapWriteCombineCache));
+        /* The five payloads come from the pool; the table pages come from the system on demand (2df9f1c), not from the pool. */
+        CHECK(fixture.device_ranges==ranges+5 && fixture.last_map_options==(kIOMapAnywhere|kIOMapWriteCombineCache));
+        (void)created;
         NativeAdrenoGmuAllocator &gmu=context.allocator();
-        const NativeAdrenoMemory *objects[6]={&gmu.icache(),&gmu.dummy(),&gmu.debug(),&gmu.log(),&gmu.hfi(),&gmu.tables()};
-        const NativeAdrenoGmuSizes sizes=NativeAdrenoGmuDefaultSizes(NativeAdrenoGmuContext::TablePages*0x1000);
-        const uint64_t bytes[6]={sizes.icache,sizes.dummy,sizes.debug,sizes.log,sizes.hfi,sizes.tables};
+        const NativeAdrenoMemory *objects[5]={&gmu.icache(),&gmu.dummy(),&gmu.debug(),&gmu.log(),&gmu.hfi()};
+        const NativeAdrenoGmuSizes sizes=NativeAdrenoGmuDefaultSizes();
+        const uint64_t bytes[5]={sizes.icache,sizes.dummy,sizes.debug,sizes.log,sizes.hfi};
         uint64_t at=SHENG_GMU_POOL_BASE;
-        for(unsigned i=0;i<6;++i) {
+        for(unsigned i=0;i<5;++i) {
             CHECK(objects[i]->spanCount()==1 && objects[i]->spans()[0].physical==at && objects[i]->bytes()==bytes[i]);
             at+=bytes[i];
         }
         CHECK(at<=SHENG_GMU_POOL_BASE+SHENG_GMU_POOL_BYTES);
-        CHECK(report.ttbr0==((uint64_t(1)<<48)|gmu.tables().spans()[0].physical));
+        CHECK(report.ttbr0==((uint64_t(1)<<48)|gmu.tables().pagePhysical(0)));
         const NativeAdrenoGmuMemoryLayout &layout=gmu.layout();
         CHECK(layout.icache_iova==0x4000 && layout.dummy_iova==0x60000000 && layout.debug_iova==0x60400000);
         CHECK(layout.log_iova==0x60004000 && layout.hfi_iova==0x60008000);
@@ -189,7 +192,7 @@ int main()
     {
         NativeAdrenoGmuAllocator gmu;
         const unsigned ranges=fixture.device_ranges;
-        CHECK(gmu.adopt(SHENG_GMU_POOL_BASE,0x1000000,NativeAdrenoGmuDefaultSizes(NativeAdrenoGmuContext::TablePages*0x1000),36)==
+        CHECK(gmu.adopt(SHENG_GMU_POOL_BASE,0x1000000,NativeAdrenoGmuDefaultSizes(),36)==
             kIOReturnNoResources && fixture.device_ranges==ranges);
     }
     std::printf("PASS: 1 GMU context on the reserved pool with the asteroids SMMU IDs and 1 short-pool refusal\n");

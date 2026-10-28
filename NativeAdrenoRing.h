@@ -59,14 +59,18 @@ class NativeAdrenoRing final {
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
     uint32_t context_=0;
+    /* The GPU page table the CP runs (TTBR0 with its ASID in bits 63:48) and whether the next framed prologue must switch to it. */
+    uint64_t table_=0;
+    bool table_pending_=false;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
     uint32_t resetWords() const;
-    IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
+    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+    IOReturn program();
 public:
     NativeAdrenoRing()=default;
     ~NativeAdrenoRing()=default;
@@ -100,6 +104,33 @@ public:
      * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
      * counters to the next, and the threads waited on each other for good (int-249..254: BR in a later IB than BV, no fault). */
     void useContext(uint32_t context) {if(context!=context_) {context_=context;reset_pending_=true;}}
+    /* The GPU page table of the submission that comes next (a process's own table: TTBR0 with its ASID in bits 63:48). A change is
+     * a context switch with a table switch: the next framed prologue carries a6xx_set_pagetable()'s CP_SMMU_TABLE_UPDATE, which the CP
+     * executes after every earlier submission has finished (its CP_WAIT_TIMESTAMP), so each submission runs on its own table. */
+    void useTable(uint64_t ttbr0) {if(ttbr0 && ttbr0!=table_) {table_=ttbr0;table_pending_=true;reset_pending_=true;}}
+    /* What the bank holds now, set by the CPU (bring-up, or a table written while the GPU was idle): no packet is due for it. */
+    void tableInstalled(uint64_t ttbr0) {table_=ttbr0;table_pending_=false;}
+    uint32_t context() const {return context_;}
+    /* After a GPU reset (the board's restart, NativeAdrenoSubmit::recover): programs the ring registers again as attach() does, empties
+     * the ring and sets the memptrs fences to `completed`, as msm's recover_worker advances memptrs->fence past the hung submission. The
+     * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
+     * Clears poison. The CP must be halted or reset. */
+    IOReturn restart(uint32_t completed);
+    /* The fence value the CP last wrote, read even when the ring is poisoned (the recovery's starting point). */
+    IOReturn fenceValue(uint32_t *value);
+    /* Words without a timestamp fence, for the restart's CP init and secure-mode packets (a7xx_cp_init and a6xx_hw_init send theirs
+     * outside any submission and wait with a6xx_idle); no fence number is used, so the replayed submissions keep theirs. */
+    IOReturn submitUnfenced(const uint32_t *words,size_t word_count);
+    /* a6xx_idle: the CP read every ring word (RPTR == WPTR), then RBBM_STATUS GPU_BUSY_IGN_AHB clear. */
+    IOReturn idle(const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
+     * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
+    IOReturn progressState(uint32_t out[6]);
+    /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
+     * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
+    IOReturn busHalt(bool gx_off,unsigned spins);
+    uint64_t table() const {return table_;}
+    bool tablePending() const {return table_pending_;}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,

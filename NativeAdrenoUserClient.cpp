@@ -2,7 +2,10 @@
 #include "NativeAdrenoUserClient.h"
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
-extern "C" {volatile uint32_t native_adreno_wc_enabled=1;}
+/* sheng-gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
+ * write-combine: no write-combined audit and no cache maintenance per submission. Effective only once the board proved IO coherence. */
+extern "C" {volatile uint32_t native_adreno_wc_enabled=1,native_adreno_owned_coherent=0;extern volatile uint32_t native_adreno_io_coherent;}
+static bool ownedCoherent() {return native_adreno_owned_coherent && native_adreno_io_coherent;}
 /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
@@ -34,30 +37,71 @@ static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t ad
 extern "C" {volatile uint32_t native_adreno_window_overflow[4][3];}   /* {count, last size KiB, last end MiB} per client window */
 NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::find(uint64_t handle)
 {
-    const uint32_t index=entries_?index_.find(handle):UINT32_MAX;
+    const uint32_t index=entry_count_?index_.find(handle):UINT32_MAX;
     if(index>=entry_count_)return nullptr;
-    Entry &entry=entries_[index];
+    Entry &entry=at(index);
     return entry.used && entry.handle==handle?&entry:nullptr;
 }
 /* A new live entry with a handle: counted and findable. */
 void NativeAdrenoUserClient::publish(Entry &entry)
 {
-    entry.used=true;entry.handle=next_handle_++;entry.token=(uint32_t)(&entry-entries_)+1;++live_;
-    index_.insert(entry.handle,(uint32_t)(&entry-entries_));
+    entry.used=true;entry.handle=next_handle_++;entry.token=entry.index+1;++live_;
+    index_.insert(entry.handle,entry.index);
 }
 void NativeAdrenoUserClient::clear(Entry &entry)
 {
     if(entry.used && live_)--live_;
     index_.erase(entry.handle);
-    const size_t index=(size_t)(&entry-entries_);if(index<free_hint_)free_hint_=index;
+    const size_t index=entry.index;if(index<free_hint_)free_hint_=index;
     entry.handle=0;entry.mapped=0;entry.iova=0;entry.used=false;
     entry.mapped_state=false;entry.unreleasable=false;entry.imported=false;entry.metadata_bytes=0;
     entry.token=0;entry.mapping_leases=0;
 }
+/* A free entry, with room in the handle index for it to be published; null without memory. */
 NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::free()
 {
-    for(size_t i=free_hint_;i<entry_count_;++i)if(!entries_[i].used) {free_hint_=i;return &entries_[i];}
-    return nullptr;
+    if(!index_.reserve(live_+1))return nullptr;
+    for(;;) {
+        for(size_t i=free_hint_;i<entry_count_;++i)if(!at(i).used) {free_hint_=i;return &at(i);}
+        free_hint_=entry_count_;
+        if(!grow())return nullptr;
+    }
+}
+bool NativeAdrenoUserClient::grow()
+{
+    if(entry_count_>=UINT32_MAX-EntryChunk)return false;   /* tokens are entry indices plus one */
+    const size_t chunk_index=entry_count_/EntryChunk;
+    if(chunk_index==chunk_slots_) {
+        const size_t slots=chunk_slots_?chunk_slots_*2:16;
+        Entry **made=IONewData(Entry *,slots);
+        if(!made)return false;
+        for(size_t i=0;i<slots;++i)made[i]=i<chunk_slots_?chunks_[i]:nullptr;
+        if(chunks_)IODeleteData(chunks_,Entry *,chunk_slots_);
+        chunks_=made;chunk_slots_=slots;
+    }
+    Entry *chunk=IONewData(Entry,EntryChunk);
+    if(!chunk)return false;
+    memset(chunk,0,sizeof(Entry)*EntryChunk);
+    for(size_t i=0;i<EntryChunk;++i)chunk[i].index=(uint32_t)(entry_count_+i);
+    chunks_[chunk_index]=chunk;entry_count_+=EntryChunk;
+    return true;
+}
+void NativeAdrenoUserClient::releaseEntries()
+{
+    for(size_t i=0;i<chunk_slots_;++i)if(chunks_[i])IODeleteData(chunks_[i],Entry,EntryChunk);
+    if(chunks_)IODeleteData(chunks_,Entry *,chunk_slots_);
+    chunks_=nullptr;chunk_slots_=0;entry_count_=0;
+}
+bool NativeAdrenoUserClient::growQueues()
+{
+    if(queue_capacity_>=UINT32_MAX/2)return false;
+    const uint32_t size=queue_capacity_?queue_capacity_*2:8;
+    Queue *made=IONewData(Queue,size);
+    if(!made)return false;
+    for(uint32_t i=0;i<size;++i)made[i]=i<queue_capacity_?queues_[i]:Queue{};
+    if(queues_)IODeleteData(queues_,Queue,queue_capacity_);
+    queues_=made;queue_capacity_=size;
+    return true;
 }
 size_t NativeAdrenoUserClient::liveObjects() const
 {
@@ -79,11 +123,10 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     if(!vm || !submit || !ring || input_bits<31 || input_bits>48 ||
         output_bits<32 || output_bits>48 || vm->poisoned() || submit->poisoned() ||
         ring->poisoned())return kIOReturnBadArgument;
-    entries_=IONewData(Entry,NativeAdrenoClientMaxObjects);
-    if(!entries_)return kIOReturnNoMemory;
-    memset(entries_,0,sizeof(Entry)*NativeAdrenoClientMaxObjects);
-    if(!index_.allocate()) {IODeleteData(entries_,Entry,NativeAdrenoClientMaxObjects);return kIOReturnNoMemory;}
-    entry_count_=NativeAdrenoClientMaxObjects;free_hint_=0;live_=0;
+    if(!grow())return kIOReturnNoMemory;
+    if(!index_.allocate()) {releaseEntries();return kIOReturnNoMemory;}
+    if(!growQueues()) {releaseEntries();index_.release();return kIOReturnNoMemory;}
+    free_hint_=0;live_=0;
     vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
     next_handle_=1;open_=true;
     queues_[0]={0,true};
@@ -92,59 +135,61 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     do context_=__atomic_add_fetch(&contexts,1,__ATOMIC_RELAXED); while(!context_);
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoUserClient::setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes)
+IOReturn NativeAdrenoUserClient::setScope(uint64_t queue_base,uint64_t window_start,uint64_t window_bytes)
 {
     if(!open_)return kIOReturnNotReady;
-    if(queue_base%NativeAdrenoAbiMaxQueues || queue_base>UINT32_MAX-NativeAdrenoAbiMaxQueues || (window_start&4095) || (window_bytes&4095) ||
+    if(queue_base%NativeAdrenoQueueRange || (window_start&4095) || (window_bytes&4095) ||
         (window_bytes && (window_start+window_bytes<window_start || window_start+window_bytes>(UINT64_C(1)<<input_bits_))))
         return kIOReturnBadArgument;
     /* A client that owns no range yet has none to drain: its queue_base_ is the default 0, the render server's range, and the render server
      * nearly always has a job in flight, so every other process was refused here with kIOReturnBusy (int-200: WidgetRenderer_Default). */
-    if(liveObjects() || ownRangeOutstanding() || submit_->rangeOutstanding(queue_base,NativeAdrenoAbiMaxQueues))return kIOReturnBusy;
+    if(liveObjects() || ownRangeOutstanding() || submit_->rangeOutstanding(queue_base,NativeAdrenoQueueRange))return kIOReturnBusy;
     queue_base_=queue_base;scoped_=true;window_start_=window_start;window_bytes_=window_bytes;window_peak_=0;
     return kIOReturnSuccess;
 }
 bool NativeAdrenoUserClient::ownRangeOutstanding() const
 {
-    return (scoped_ || used_) && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues);
+    return (scoped_ || used_) && submit_->rangeOutstanding(queue_base_,NativeAdrenoQueueRange);
 }
 IOReturn NativeAdrenoUserClient::close()
 {
     if(!open_)return kIOReturnNotReady;
     if(liveObjects() || ownRangeOutstanding())return kIOReturnBusy;
-    for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(queues_[i].active)return kIOReturnBusy;
-    IODeleteData(entries_,Entry,entry_count_);entry_count_=0;index_.release();
+    for(uint32_t i=1;i<queue_capacity_;++i)if(queues_[i].active)return kIOReturnBusy;
+    releaseEntries();index_.release();
+    if(queues_)IODeleteData(queues_,Queue,queue_capacity_);
+    queues_=nullptr;queue_capacity_=0;
     queue_base_=0;scoped_=used_=false;window_start_=window_bytes_=window_peak_=0;
-    open_=false;for(auto &queue:queues_)queue=Queue{};vm_=nullptr;submit_=nullptr;ring_=nullptr;timer_=nullptr;status_=nullptr;info_=nullptr;
+    open_=false;vm_=nullptr;submit_=nullptr;ring_=nullptr;timer_=nullptr;status_=nullptr;info_=nullptr;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::releaseAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     if(!open_)return kIOReturnNotReady;
     if(!clock)return kIOReturnBadArgument;
-    IOReturn status=(scoped_ || used_)?submit_->waitRange(queue_base_,NativeAdrenoAbiMaxQueues,clock,timeout_us):kIOReturnSuccess;
+    IOReturn status=(scoped_ || used_)?submit_->waitRange(queue_base_,NativeAdrenoQueueRange,clock,timeout_us):kIOReturnSuccess;
     if(status)return status;
     for(size_t index=0;index<entry_count_;++index) {
-        Entry &entry=entries_[index];
+        Entry &entry=at(index);
         if(!entry.used)continue;
         entry.mapping_leases=0;
         NativeAdrenoAbiBoFree request{entry.handle};
         status=freeBo(&request);
         if(status)return status;
     }
-    for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)queues_[i]=Queue{};
+    for(uint32_t i=1;i<queue_capacity_;++i)queues_[i]=Queue{};
     return close();
 }
 NativeAdrenoMemory *NativeAdrenoUserClient::memoryForToken(uint32_t token)
 {
     if(!open_ || !token || token>entry_count_)return nullptr;
-    Entry &entry=entries_[token-1];
+    Entry &entry=at(token-1);
     return entry.used && !entry.unreleasable && entry.token==token && entry.mapping_leases?&entry.memory:nullptr;
 }
 uint32_t NativeAdrenoUserClient::mappingLeases(uint32_t token) const
 {
     if(!open_ || !token || token>entry_count_)return 0;
-    const Entry &entry=entries_[token-1];
+    const Entry &entry=at(token-1);
     return entry.used && entry.token==token?entry.mapping_leases:0;
 }
 IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
@@ -154,19 +199,19 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     if(!open_)return kIOReturnNotReady;
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
-    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    params->flags=NativeAdrenoParamsHostImport|(ownedCoherent()?NativeAdrenoParamsOwnedCoherent:0u)|
+        (NativeAdrenoMemory::poolPressure()?NativeAdrenoParamsPoolPressure:0u);params->max_bo_bytes=maxBoBytes();
     return kIOReturnSuccess;
 }
 /* Per client slot (4, the kernel's own client last): [0] live objects now, [1] their peak, [2] refused BoAllocs, [3] last refusal status,
  * [4] bytes of the last refused request, [5] the window's highest mapped end in MiB above its start. Turnip turns any refusal into
  * VK_ERROR_OUT_OF_DEVICE_MEMORY, which its command streams do not check (int-237: backboardd wrote through a NULL stream pointer). */
 extern "C" {volatile uint32_t native_adreno_client_stats[5][6];}
-static volatile uint32_t *clientStats(uint32_t queue_base,uint64_t window_bytes) {
-    const uint32_t slot=window_bytes?queue_base/NativeAdrenoAbiMaxQueues:4;
+static volatile uint32_t *clientStats(uint32_t slot) {
     return native_adreno_client_stats[slot<4?slot:4];
 }
-static void noteLive(uint32_t queue_base,uint64_t window_bytes,size_t live) {
-    volatile uint32_t *stats=clientStats(queue_base,window_bytes);
+static void noteLive(uint32_t slot,size_t live) {
+    volatile uint32_t *stats=clientStats(slot);
     stats[0]=(uint32_t)live;if(live>stats[1])stats[1]=(uint32_t)live;
 }
 IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
@@ -174,10 +219,10 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
 {
     const IOReturn status=allocBoInner(request,reply);
     if(status && request) {
-        volatile uint32_t *stats=clientStats(queue_base_,window_bytes_);
+        volatile uint32_t *stats=clientStats(stats_slot_);
         stats[2]=stats[2]+1;stats[3]=(uint32_t)status;stats[4]=(uint32_t)request->bytes;
     }
-    if(entries_)noteLive(queue_base_,window_bytes_,liveObjects());
+    if(entry_count_)noteLive(stats_slot_,liveObjects());
     return status;
 }
 IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *request,
@@ -185,17 +230,20 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->handle=0;
     if(!open_)return kIOReturnNotReady;
-    const uint64_t limit=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    const uint64_t limit=maxBoBytes();
     if(!request->bytes || (request->bytes&4095) || request->bytes>limit ||
         request->align_log2<12 || request->align_log2>24 || request->contiguous>1)
         return kIOReturnBadArgument;
     Entry *entry=free();
     if(!entry)return kIOReturnNoResources;
     /* A scattered allocation costs one VM span per physical page (int-030: 16 MiB came back as 4096 single-page spans, the
-     * whole span table), so larger objects try one contiguous run first and fall back to scattered pages unless the
-     * caller demanded contiguity. */
+     * whole span table), so without a pool larger objects try one contiguous run first and fall back to scattered pages unless the
+     * caller demanded contiguity. With the board's pool, the allocation below already takes a contiguous run from it first; a
+     * run from XNU would scan physical memory for every larger BO once the pool is full (untagged-203fd45bf: 96 MiB searches over
+     * 1.2 million pages, found nothing), as msm never does for a GEM object. */
     IOReturn status=kIOReturnUnsupported;
-    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
+    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes &&
+        !NativeAdrenoMemory::poolBytes();
     if(prefer_contiguous) {
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
@@ -207,7 +255,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
      * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
      * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
      * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
-    if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
+    if(!status && native_adreno_wc_enabled && !ownedCoherent())status=entry->memory.makeWriteCombined();
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
@@ -227,7 +275,7 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
     if(!request || !reply)return kIOReturnBadArgument;reply->handle=0;
     if(!open_)return kIOReturnNotReady;
     native_adreno_import_diag[0]=native_adreno_import_diag[0]+1;
-    const uint64_t limit=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    const uint64_t limit=maxBoBytes();
     if(!task || !request->address || ((request->address|request->bytes)&4095) || !request->bytes || request->bytes>limit) {
         noteImport(kIOReturnBadArgument,1,request->bytes,request->address);
         return kIOReturnBadArgument;
@@ -266,7 +314,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     const uint64_t end=request->iova+entry->memory.bytes();
     if(window_bytes_ && (request->iova<window_start_ || end<request->iova || end>window_start_+window_bytes_)) {
         /* Per window: how often a mapping fell outside it, and the last one's size and end (MiB), for the boot log's [gpu windows] row. */
-        const uint32_t slot=queue_base_/NativeAdrenoAbiMaxQueues;
+        const uint32_t slot=stats_slot_;
         if(slot<4) {
             native_adreno_window_overflow[slot][0]=native_adreno_window_overflow[slot][0]+1;
             native_adreno_window_overflow[slot][1]=uint32_t(entry->memory.bytes()>>10);
@@ -282,7 +330,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
      * non-cacheable: their CPU view is write-combined, and a snoop could find a stale line of the kernel's cacheable alias. */
     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
-    const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    const bool coherent=(entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u)) || (!entry->memory.imported() && ownedCoherent());
     vm_->setOwner(context_);
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
         coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
@@ -290,7 +338,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     if(status)return status;
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
     if(end>window_peak_)window_peak_=end;
-    if(window_bytes_ && window_peak_>window_start_)clientStats(queue_base_,window_bytes_)[5]=(uint32_t)((window_peak_-window_start_)>>20);
+    if(window_bytes_ && window_peak_>window_start_)clientStats(stats_slot_)[5]=(uint32_t)((window_peak_-window_start_)>>20);
     reply->iova=request->iova;
     return kIOReturnSuccess;
 }
@@ -333,8 +381,10 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->fence=0;
     if(!open_)return kIOReturnNotReady;
+    /* reserved is the asteroids Turnip's per-submission counts (above), not checked: the merge of sheng's queue growth (da3ff41) had
+     * refused a nonzero word, which would have refused every submission of this board's Turnip. */
     if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers)return kIOReturnBadArgument;
-    if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active)
+    if(request->queue>=queue_capacity_ || !queues_[request->queue].active)
         return kIOReturnBadArgument;
     if(request->wait_fence) {
         if(!clock)return kIOReturnBadArgument;
@@ -356,8 +406,8 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     used_=true;
     ring_->useContext(context_);
     vm_->setOwner(context_);
-    const IOReturn status=submit_->submit(buffers,request->buffer_count,
-        queue_base_+static_cast<uint32_t>(request->queue),&fence);
+    const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
+        queue_base_+request->queue,&fence,clock);
     vm_->setOwner(0);
     if(status)return status;
     native_adreno_submit_stats[fence&255]=request->reserved;
@@ -406,8 +456,9 @@ IOReturn NativeAdrenoUserClient::status(NativeAdrenoAbiStatus *reply)
     if(!reply)return kIOReturnBadArgument;*reply={};
     if(!open_)return kIOReturnNotReady;
     if(!status_)return kIOReturnUnsupported;
+    /* msm MSM_PARAM_FAULTS: the global count plus this client's own VM's (a hang its submission caused). */
     const NativeAdrenoStatusCounts counts=status_->counts();
-    reply->faults=counts.faults;reply->suspends=counts.suspends;
+    reply->faults=counts.faults+(vm_?vm_->faults():0);reply->suspends=counts.suspends;
     return kIOReturnSuccess;
 }
 size_t NativeAdrenoUserClient::inputSize(uint32_t method)
@@ -627,22 +678,24 @@ IOReturn NativeAdrenoUserClient::createQueue(NativeAdrenoAbiQueueReply *reply)
 {
     if(!reply)return kIOReturnBadArgument;
     if(!open_)return kIOReturnNotReady;
-    for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(!queues_[i].active) {
-        queues_[i]={static_cast<uint32_t>(i),true};
-        reply->queue=i;
-        return kIOReturnSuccess;
+    for(;;) {
+        for(uint32_t i=1;i<queue_capacity_;++i)if(!queues_[i].active) {
+            queues_[i]={i,true};
+            reply->queue=i;
+            return kIOReturnSuccess;
+        }
+        if(!growQueues())return kIOReturnNoMemory;
     }
-    return kIOReturnNoResources;
 }
 IOReturn NativeAdrenoUserClient::closeQueue(const NativeAdrenoAbiQueue *request)
 {
     if(!request)return kIOReturnBadArgument;
     if(!open_)return kIOReturnNotReady;
-    if(!request->queue || request->queue>=NativeAdrenoAbiMaxQueues)return kIOReturnBadArgument;
+    if(!request->queue || request->queue>=queue_capacity_)return kIOReturnBadArgument;
     Queue &queue=queues_[request->queue];
     if(!queue.active)return kIOReturnBadArgument;
     /* A queue must be drained by the caller before it disappears. */
-    if(submit_->queueOutstanding(queue_base_+static_cast<uint32_t>(request->queue)))
+    if(submit_->queueOutstanding(queue_base_+request->queue))
         return kIOReturnBusy;
     queue={};
     return kIOReturnSuccess;

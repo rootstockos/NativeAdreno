@@ -29,7 +29,7 @@ extern struct NativeAdrenoMetalDiag native_adreno_metal_diag;
 extern struct NativeAdrenoOpenRecord native_adreno_open_log[8];
 extern volatile uint32_t native_adreno_open_log_count;
 extern struct NativeAdrenoClientRecord native_adreno_client_log[8];
-extern struct NativeAdrenoClientText native_adreno_client_text[4];
+extern struct NativeAdrenoClientText native_adreno_client_text[8];
 extern volatile uint32_t native_adreno_mount_fail[4];
 #if defined(__cplusplus)
 }

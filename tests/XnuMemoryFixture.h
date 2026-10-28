@@ -14,7 +14,7 @@ using IOByteCount=size_t;
 using addr64_t=uint64_t;
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
  kIOReturnNoResources=3,kIOReturnNoMemory=4,kIOReturnUnsupported=5,
- kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8,kIOReturnNotFound=9;
+ kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8,kIOReturnNotFound=9,kIOReturnInternalError=10,kIOReturnNotPermitted=11;
 constexpr unsigned kIOMapAnywhere=1,kIOMapWriteCombineCache=0x400;
 using IODirection=unsigned;
 constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,
@@ -141,4 +141,9 @@ public:
         std::memset(d->device_raw,0xa5,bytes);++fixture.devices_live;++fixture.device_ranges;return d;
     }
 };
+/* Clock and pmap types the driver's bookkeeping names; the host never measures with them. */
+using ppnum_t=uint32_t;
+inline uint64_t mach_absolute_time() {static uint64_t now;return ++now;}
+inline void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *out) {*out=ns;}
+inline void IODelay(unsigned) {}
 #endif
