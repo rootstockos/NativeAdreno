@@ -653,6 +653,8 @@ IOReturn NativeAdrenoUserClient::closeQueue(const NativeAdrenoAbiQueue *request)
 extern "C" {volatile uint32_t native_adreno_optime[15];}
 /* T59: the client's GMEM pass stages (SetMetadata tagged TILE, 16 words; Turnip turnip-asteroids-timing.patch), added up like TIME. */
 extern "C" {volatile uint32_t native_adreno_tiletime[16];}
+/* T60: the client's passes by size with the autotune's draws and samples passed (SetMetadata tagged FRAG, 16 words). */
+extern "C" {volatile uint32_t native_adreno_fragstats[16];}
 IOReturn NativeAdrenoUserClient::setMetadata(const NativeAdrenoAbiMetadata *request)
 {
     if(!request)return kIOReturnBadArgument;
@@ -661,6 +663,15 @@ IOReturn NativeAdrenoUserClient::setMetadata(const NativeAdrenoAbiMetadata *requ
         uint32_t words[15]={};
         memcpy(words,request->text,request->bytes<sizeof(words)?request->bytes:sizeof(words));
         for(unsigned i=0;i<15;++i)native_adreno_optime[i]=native_adreno_optime[i]+words[i];
+        return kIOReturnSuccess;
+    }
+    if(request->reserved==0x46524147u) {
+        uint32_t words[16]={};
+        memcpy(words,request->text,request->bytes<sizeof(words)?request->bytes:sizeof(words));
+        for(unsigned i=0;i<16;++i) {
+            if(i==15)native_adreno_fragstats[i]=words[i]>native_adreno_fragstats[i]?words[i]:native_adreno_fragstats[i];   /* most draws: a maximum */
+            else native_adreno_fragstats[i]=native_adreno_fragstats[i]+words[i];
+        }
         return kIOReturnSuccess;
     }
     if(request->reserved==0x54494c45u) {
