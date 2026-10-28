@@ -2,6 +2,9 @@
 #include "NativeAdrenoRing.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
+/* Called with each fence right after its submission is committed, when a board sets it (asteroids GpuPowerProbe times the GPU's work
+ * per submission from it and the fence interrupt). Null otherwise. */
+extern "C" {void (*volatile native_adreno_ring_hook)(uint32_t fence);}
 
 /* Values are taken from the pinned Linux source, not guessed:
  * drivers/gpu/drm/msm/registers/adreno/a6xx.xml (register offsets), and
@@ -321,6 +324,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(io_.barrier(io_.cookie))return poison();
     if(writeWptr(end))return kIOReturnIOError;
     next_=end;*fence=++seqno_;++submissions_;
+    if(native_adreno_ring_hook)native_adreno_ring_hook(seqno_);
     if(reset)reset_pending_=false;
     return kIOReturnSuccess;
 }

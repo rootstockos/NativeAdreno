@@ -668,6 +668,7 @@ IOReturn NativeAdrenoUserClient::getMetadata(const NativeAdrenoAbiMetadata *requ
     if(entry->metadata_bytes)memcpy(reply->text,entry->metadata,entry->metadata_bytes);
     return kIOReturnSuccess;
 }
+extern "C" {volatile uint32_t native_adreno_wait_asked[5];}
 IOReturn NativeAdrenoUserClient::waitFence(const NativeAdrenoAbiWaitFence *request,
     const NativeAdrenoRingClock *clock)
 {
@@ -677,5 +678,9 @@ IOReturn NativeAdrenoUserClient::waitFence(const NativeAdrenoAbiWaitFence *reque
     const uint32_t timeout_us=request->timeout_ns==0?0:
         (request->timeout_ns>UINT64_C(0xffffffff)*1000u?0xffffffffu:
         (uint32_t)(request->timeout_ns/1000));
+    /* Who polls (asteroids T49: 198049 waits, 99 % timed out): the timeouts clients ask for, [0] none (a poll), [1] under 1 ms,
+     * [2] under 10 ms, [3] under 100 ms, [4] longer. */
+    const unsigned bucket=timeout_us==0?0:timeout_us<1000?1:timeout_us<10000?2:timeout_us<100000?3:4;
+    native_adreno_wait_asked[bucket]=native_adreno_wait_asked[bucket]+1;
     return submit_->wait((uint32_t)request->fence,clock,timeout_us);
 }
