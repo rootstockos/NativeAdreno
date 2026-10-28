@@ -56,7 +56,6 @@ enum : uint32_t {
     RingSliceSramWords = 2,
     RingFenceWords = 7,       /* kernel bring-up submissions: TYPE4 scratch + TYPE7 event */
     RingFramedFenceWords = 31,/* user submissions: scratch, BV timestamp, BR wait, ring timestamp */
-    RingEndFlushWords = 3,    /* setEndFlush: CACHE_FLUSH7 and CP_WAIT_FOR_IDLE ahead of the framed fence's timestamps */
     RingBvFenceOffset = 12    /* msm_rbmemptrs.bv_fence; +8 is bv_rptr, the BV RPTR shadow hw init programs */
 };
 static uint32_t ilog2(size_t value)
@@ -66,10 +65,6 @@ static uint32_t ilog2(size_t value)
 /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
  * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
 extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
-/* The newest fence number handed out, for readers outside the GPU driver: a display that scans out a surface directly waits until the
- * fence page's completed timestamp (native_adreno_fence_phys + 4) reaches the value this held when the frame was swapped, so it never
- * shows a surface the GPU is still drawing. Written after WPTR, so a reader never waits for a fence the CP was not given. */
-extern "C" {volatile uint32_t native_adreno_submitted_fence;}
 IOReturn NativeAdrenoRing::poison()
 {
     poisoned_=true;return kIOReturnIOError;
@@ -222,8 +217,7 @@ IOReturn NativeAdrenoRing::emitFence(uint32_t at,uint32_t seqno,uint32_t *end)
 IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end)
 {
     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
-    uint32_t words[RingFramedFenceWords+RingEndFlushWords]={0};
-    const uint32_t count=RingFramedFenceWords+(end_flush_?RingEndFlushWords:0);
+    uint32_t words[RingFramedFenceWords]={0};
     if(AdrenoPM4Type4(regs_->ring_scratch,1,&words[0])!=AdrenoPM4Success)return poison();
     words[1]=seqno;
     /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
@@ -236,11 +230,6 @@ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *
     size_t n=packet(words,2,RingThreadControl,&br,1);
     if(n)n=packet(words,n,RingFenceOpcode,&depth,1);
     if(n)n=packet(words,n,RingFenceOpcode,&color,1);
-    if(end_flush_) {
-        const uint32_t flush=RingCacheFlush7;
-        if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
-        if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
-    }
     if(n)n=packet(words,n,RingThreadControl,&bvThread,1);
     if(n)n=packet(words,n,RingFenceOpcode,bvWrite,4);
     if(n)n=packet(words,n,RingThreadControl,&br,1);
@@ -248,9 +237,9 @@ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *
     if(n)n=packet(words,n,RingFenceOpcode,fence,4);
     if(n)n=packet(words,n,RingThreadControl,&both,1);
     if(n)n=packet(words,n,RingSetMarker,&marker,1);
-    if(n!=count)return poison();
-    for(uint32_t i=0;i<count;++i)ring_[(at+i)&mask]=words[i];
-    *end=(at+count)&mask;return kIOReturnSuccess;
+    if(n!=RingFramedFenceWords)return poison();
+    for(uint32_t i=0;i<RingFramedFenceWords;++i)ring_[(at+i)&mask]=words[i];
+    *end=(at+RingFramedFenceWords)&mask;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
     void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova)
@@ -302,7 +291,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     const bool reset=framed && reset_pending_;
-    const uint32_t extra=framed?RingPrologueWords+(reset?resetWords():0)+RingFramedFenceWords+(end_flush_?RingEndFlushWords:0):RingFenceWords;
+    const uint32_t extra=framed?RingPrologueWords+(reset?resetWords():0)+RingFramedFenceWords:RingFenceWords;
     if(word_count>size_words-extra-8)return kIOReturnNoResources;
     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
     if(status)return status;
@@ -332,7 +321,6 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(io_.barrier(io_.cookie))return poison();
     if(writeWptr(end))return kIOReturnIOError;
     next_=end;*fence=++seqno_;++submissions_;
-    native_adreno_submitted_fence=seqno_;
     if(reset)reset_pending_=false;
     return kIOReturnSuccess;
 }

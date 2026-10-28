@@ -605,8 +605,6 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                             ring_cache_={&ring_mem_,&fence_mem_};
                                             NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
                                             ring_status=ring_.setRegisters(regs_);
-                                            {unsigned endFlush=0;PE_parse_boot_argn("sheng-gpu-endflush",&endFlush,sizeof(endFlush));
-                                             ring_.setEndFlush(endFlush==1);}
                                             if(!ring_status)ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
                                             if(!ring_status && sqe_bytes) {
