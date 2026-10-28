@@ -97,7 +97,7 @@ public:
     /* Every framed submission ends with CACHE_FLUSH7 and a wait for idle before its timestamps, so what it drew is in memory when its
      * fence reports it. The prologue's flush otherwise writes it out only when the next submission starts: the GPU's own readers saw it
      * (they go through those caches), a display fetching the surface itself did not (asteroids T42-T43: zero copy showed the wallpaper
-     * without the app's layer on top while the GPU copy never did). Off by default; sheng-gpu-endflush=1 in NativeAdrenoService. */
+     * without the app's layer on top while the GPU copy never did). Off by default; the owner sets it (sheng-gpu-endflush=1 in NativeAdrenoService and asteroids' GpuPowerProbe). */
     void setEndFlush(bool on) {end_flush_=on;}
     void requestContextReset() {reset_pending_=true;}
     /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the
