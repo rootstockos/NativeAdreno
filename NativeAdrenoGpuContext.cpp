@@ -6,6 +6,8 @@
 #include <kern/task.h>
 #include "AdrenoPM4.h"
 
+extern "C" volatile uint32_t native_adreno_pool_mib,native_adreno_pool_stats[8];
+extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_owned_coherent;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
@@ -30,6 +32,22 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         if(!report->output_bits)status=kIOReturnUnsupported;
         /* Stage-1 input size: smmu->va_size from ID2.UBS (arm_smmu_init_domain_context: ias = smmu->va_size for AArch64 stage 1). */
         input_bits_=NativeAdrenoSmmuInputBits(report->id2);
+    }
+    /* The BO pool, taken first, while the VM still has long contiguous runs (sheng-gpu-pool MiB, 0 = none): what one chunk cannot have at
+     * one size is tried at the next smaller, up to the size asked for; none is not an error, user BOs then come from the system. */
+    if(!status && native_adreno_pool_mib && !NativeAdrenoMemory::poolBytes()) {
+        size_t want=(size_t)native_adreno_pool_mib<<20;
+        IOReturn pooled=kIOReturnSuccess;
+        for(size_t mib=native_adreno_pool_mib;mib>=16 && want && (want>>20)>=16;) {
+            const size_t bytes=(mib<<20)<want?mib<<20:want;
+            pooled=NativeAdrenoMemory::reservePool(report->output_bits,bytes);
+            if(pooled==kIOReturnSuccess)want-=bytes;
+            else if(pooled==kIOReturnNoResources)break;   /* every chunk slot taken */
+            else mib>>=1;
+        }
+        native_adreno_pool_stats[5]=(uint32_t)pooled;
+        if(NativeAdrenoMemory::poolBytes() && native_adreno_wc_enabled && !native_adreno_owned_coherent)
+            (void)NativeAdrenoMemory::writeCombinePool();
     }
     for(unsigned i=0;!status && i<GpuBufferCount;++i)
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);

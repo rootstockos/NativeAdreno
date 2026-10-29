@@ -50,7 +50,9 @@ class NativeAdrenoMemory final {
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
-    bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
+    bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false,pooled_=false;
+    unsigned pool_chunk_=0;
+    size_t pool_offset_=0;
     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -74,6 +76,16 @@ public:
      * 96 MiB failed and the pressure it reported stayed on, so the clients' BO caches flushed and allocated again (5.6 GB of maintenance).
      * Client views map this descriptor itself (the VM object and its attribute), not its physical pages. */
     IOReturn allocateSystem(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined);
+    /* A user BO cut from the pool (reservePool): one contiguous span, its CPU mapping the chunk's, the chunk's attribute (write-combined
+     * once writeCombinePool ran, which must match write_combined). kIOReturnNoSpace when no such chunk has room: the caller takes the
+     * memory from the system instead. */
+    IOReturn allocatePooled(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined);
+    /* Board only, at bring-up while memory still has long contiguous runs: one more chunk of `bytes` below 2^output_bits (at most 8). */
+    static IOReturn reservePool(unsigned output_bits,size_t bytes);
+    /* Every chunk write-combined once, for good, and every later one as it is reserved; when user BOs are write-combined. */
+    static IOReturn writeCombinePool();
+    static size_t poolBytes();
+    bool pooled() const {return pooled_;}
     /* Memory pressure: the system could not give a user BO its memory (allocateSystem failed); cleared by the next one that succeeds.
      * Clients read it in Query and give their cached BOs back. */
     static bool memoryPressure();
@@ -107,8 +119,8 @@ public:
      * (int-160: 123847 pages; untagged-2319cf3e5: 685208 pages, 3.8 s of submissions), while a view of a VM object maps it with the
      * object's own attribute. The submissions' line audit still covers every object. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
-    {return write_combined_ && span_count_ && !system_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_ || borrowed_;}
+    {return write_combined_ && span_count_ && !system_ && !pooled_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
+    bool backed() const {return descriptor_ || imported_ || borrowed_ || pooled_;}
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();

@@ -240,13 +240,16 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
      * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
      * (the kernel's cacheable alias read zeros past the first line too). A coherent own BO needs a client that asks for a write-back view. */
     const bool write_combined=native_adreno_wc_enabled && !ownedCoherent();
-    IOReturn status;
-    if(request->contiguous) {
-        /* Only a caller that needs one physical run gets the kernel's contiguous allocation (XNU scans physical memory for it). */
-        status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
-        if(!status && write_combined)status=entry->memory.makeWriteCombined();
+    /* The pool first: one span per BO and no attribute change; the system when it has no room. */
+    IOReturn status=entry->memory.allocatePooled((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
+    if(status==kIOReturnNoSpace) {
+        if(request->contiguous) {
+            /* Only a caller that needs one physical run gets the kernel's contiguous allocation (XNU scans physical memory for it). */
+            status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
+            if(!status && write_combined)status=entry->memory.makeWriteCombined();
+        }
+        else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
     }
-    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
