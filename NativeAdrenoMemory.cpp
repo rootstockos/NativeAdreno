@@ -133,9 +133,14 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
     if(status==kIOReturnSuccess) {
         prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
         status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
-        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
-        if(status==kIOReturnSuccess && !write_combined) {
-            status=maintainImported(0,bytes,NativeAdrenoClean);
+        /* The zero fill may still sit in the CPU's caches as dirty lines: the VM fills the pages through the kernel's cacheable alias, and
+         * on xnu-10063 (asteroids) the attribute change that follows rewrites the PTEs and flushes the TLB but cleans no line
+         * (pmap_batch_set_cache_attributes flushes caches for VM_WIMG_RT only). A dirty line written back later lands over what the CPU
+         * wrote through a write-combined mapping or the GPU wrote: every first user job hung in asteroids T64b while the kernel's own
+         * one-page test passed. Clean every buffer's lines by physical address before anyone uses it, and drop them for write-combined
+         * ones, whose pages no CPU should cache again. */
+        if(status==kIOReturnSuccess) {
+            status=maintainImported(0,bytes,write_combined?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
             NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
         }
         if(status!=kIOReturnSuccess) {write_combined_=false;(void)release();}

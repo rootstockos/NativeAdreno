@@ -20,18 +20,20 @@ extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,cha
 int main()
 {
     fixture.mode=ScatterUnlessContiguous;
-    /* Write-combined: the entry carries the mode, the VM sets the pages' attribute; nothing here touches a page or its attribute. */
+    /* Write-combined: the entry carries the mode and the VM sets the pages' attribute, but on xnu-10063 that change cleans no cache line:
+     * the zero fill's lines are cleaned and invalidated by physical address, one call per span (asteroids T64b). No attribute call. */
     NativeAdrenoMemory a,b,c,d;
     CHECK(!a.allocateSystem(96u<<20,40,96u<<20,true) && a.system() && a.writeCombined() && !a.mapping() && a.descriptor());
     CHECK(a.spanCount()==(96u<<20)/4096 && fixture.pageable==1 && fixture.write_combined_entries==1 && fixture.prepared==1);
-    CHECK(attribute_calls==0 && fixture.cache_calls==0 && physical_calls==0 && !NativeAdrenoMemory::memoryPressure());
+    CHECK(attribute_calls==0 && fixture.cache_calls==0 && physical_calls==(96u<<20)/4096 && !NativeAdrenoMemory::memoryPressure());
     CHECK(native_adreno_bo_memory[0]==1 && native_adreno_bo_memory[4]==96 && native_adreno_bo_memory[5]==96);
     CHECK(a.makeWriteCombined()==kIOReturnNotReady);   /* the entry carries the mode */
     uint32_t reset=0;CHECK(!a.reassertWriteCombined(&reset) && !reset);
     /* Default attribute: the zero fill is written back through the physical pages, no kernel mapping. */
-    CHECK(!b.allocateSystem(64u<<10,40,64u<<10,false) && !b.writeCombined() && physical_calls==16 && fixture.write_combined_entries==1);
-    CHECK(!b.publishForDevice(0,64u<<10,true) && physical_calls==32);
-    CHECK(!b.acquireDeviceWrites(0,64u<<10) && physical_calls==48);
+    const unsigned before=physical_calls;
+    CHECK(!b.allocateSystem(64u<<10,40,64u<<10,false) && !b.writeCombined() && physical_calls==before+16 && fixture.write_combined_entries==1);
+    CHECK(!b.publishForDevice(0,64u<<10,true) && physical_calls==before+32);
+    CHECK(!b.acquireDeviceWrites(0,64u<<10) && physical_calls==before+48);
     /* The owned-page map: a's and b's pages, nothing else. */
     CHECK(NativeAdrenoMemory::ownsAnyPage(a.spans(),1) && NativeAdrenoMemory::ownsAnyPage(b.spans()+3,1));
     const NativeAdrenoPhysicalSpan foreign{0,b.spans()[0].physical+4096,4096};   /* the fixture scatters every other page */
